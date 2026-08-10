@@ -11,11 +11,12 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -26,29 +27,46 @@ from starlette.background import BackgroundTask
 
 from services.agent import MashupDecision, decide_arrangement, decide_mashup_strategy
 from services.audio import get_bpm, get_key, minimal_meeting_shifts
-from services.allin1_structure import resolve_sections_for_song
-from services.demucs import DemucsError, separate_full_stems
+from services.demucs import DemucsError, ensure_allin1_demix_layout, separate_full_stems
 from services.dual_mix import (
     CreativeMode,
     PhraseVocalPolicy,
     build_bassline_mashup,
     build_dual_vocal_mashup,
-    reassemble_session,
 )
-from services.library import list_library_tracks, rank_library_against_query
+from services.form_analysis import resolve_sections_dsp, resolve_sections_llm
 from services.mashability import MashabilityWeights
+from services.studio_mix import (
+    apply_committed_sections,
+    ensure_song_preview,
+    extract_song_range,
+    load_studio,
+    render_studio,
+    save_studio,
+)
 
 load_dotenv()
 
+# Hugging Face auth for allin1 / hub downloads.
+_hf = (os.getenv("HF_TOKEN") or os.getenv("HF_TOKEM") or "").strip()
+if _hf:
+    os.environ["HF_TOKEN"] = _hf
+    os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", _hf)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+if _hf:
+    logger.info("HF token present (Hugging Face downloads authenticated)")
+else:
+    logger.info("HF token absent (public HF downloads only)")
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 SESSIONS_ROOT = Path("/tmp/mashup_sessions")
 SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="AI Song Mashup API", version="0.2.0")
+app = FastAPI(title="AI Song Mashup API", version="0.3.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 VocalPolicyForm = Literal[
@@ -57,6 +75,7 @@ VocalPolicyForm = Literal[
     "a_lead_b_harmony",
     "b_lead_a_harmony",
 ]
+StructureMode = Literal["allin1", "llm", "dsp"]
 
 
 def _allow_harmony(vocal_policy: VocalPolicyForm, _policy: PhraseVocalPolicy | None = None) -> bool:
@@ -64,8 +83,17 @@ def _allow_harmony(vocal_policy: VocalPolicyForm, _policy: PhraseVocalPolicy | N
     return vocal_policy in ("a_lead_b_harmony", "b_lead_a_harmony")
 
 
-class ReassembleBody(BaseModel):
-    enabled_indices: list[int] = Field(default_factory=list)
+class StudioPutBody(BaseModel):
+    studio: dict[str, Any] = Field(default_factory=dict)
+
+
+class StudioPreviewBody(BaseModel):
+    column_id: str | None = None
+
+
+class CommitSectionsBody(BaseModel):
+    sections_a: list[dict[str, Any]] | None = None
+    sections_b: list[dict[str, Any]] | None = None
 
 
 def _suffix_for_upload(upload: UploadFile, default: str = ".mp3") -> str:
@@ -94,6 +122,51 @@ def _metadata_header(metadata: dict) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+def _session_dir(session_id: str) -> Path:
+    session = SESSIONS_ROOT / session_id
+    if not (session / "metadata.json").is_file():
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+
+def _resolve_structure(
+    mode: StructureMode,
+    *,
+    file_path: str,
+    title: str,
+    bpm: float,
+    vocals_path: str | None,
+    work_dir: Path,
+    demix_dir: Path | None,
+) -> tuple[list, dict | None, dict]:
+    if mode == "llm":
+        return resolve_sections_llm(
+            file_path,
+            title,
+            bpm,
+            vocals_path,
+            measured_duration_sec=None,
+        )
+    if mode == "dsp":
+        return resolve_sections_dsp(
+            file_path,
+            title,
+            bpm,
+            vocals_path,
+        )
+    # allin1 (lazy import so missing natten still allows llm/dsp modes)
+    from services.allin1_structure import resolve_sections_for_song
+
+    return resolve_sections_for_song(
+        file_path,
+        title,
+        bpm,
+        vocals_path,
+        work_dir=work_dir,
+        demix_dir=demix_dir,
+    )
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -104,67 +177,245 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/api/library")
-def api_library() -> dict:
-    tracks = list_library_tracks(BASE_DIR)
+def _session_list_entry(session: Path) -> dict[str, Any] | None:
+    meta_path = session / "metadata.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    title_a = "Song A"
+    title_b = "Song B"
+    studio_path = session / "studio.json"
+    if studio_path.is_file():
+        try:
+            studio = json.loads(studio_path.read_text(encoding="utf-8"))
+            title_a = str(studio.get("title_a") or title_a)
+            title_b = str(studio.get("title_b") or title_b)
+        except Exception:  # noqa: BLE001
+            pass
+    if title_a == "Song A":
+        title_a = str(
+            (meta.get("form_a") or {}).get("title")
+            or (meta.get("structure_a") or {}).get("title")
+            or title_a
+        )
+    if title_b == "Song B":
+        title_b = str(
+            (meta.get("form_b") or {}).get("title")
+            or (meta.get("structure_b") or {}).get("title")
+            or title_b
+        )
+    mtime = meta_path.stat().st_mtime
     return {
-        "library_dir": str((BASE_DIR / "library").resolve()),
-        "tracks": [
-            {"id": t.id, "name": t.name, "bpm": t.bpm} for t in tracks
-        ],
+        "id": session.name,
+        "title_a": title_a,
+        "title_b": title_b,
+        "updated_at": mtime,
+        "has_mashup": (session / "mashup.mp3").is_file(),
+        "structure_mode": meta.get("structure_mode"),
     }
 
 
-@app.post("/api/library/search")
-async def api_library_search(
-    query: UploadFile = File(..., description="Query track to rank library against"),
-    top_k: int = Form(5),
-) -> JSONResponse:
-    with tempfile.TemporaryDirectory(prefix="lib_query_", dir="/tmp") as tmp:
-        path = Path(tmp) / f"query{_suffix_for_upload(query)}"
-        _save_upload(query, path)
-        ranked = await asyncio.to_thread(
-            rank_library_against_query,
-            str(path),
-            BASE_DIR,
-            top_k=top_k,
-        )
-    return JSONResponse({"results": ranked})
+@app.get("/api/mashup/sessions")
+def list_sessions() -> JSONResponse:
+    """List saved mashup sessions under /tmp/mashup_sessions."""
+    entries: list[dict[str, Any]] = []
+    if SESSIONS_ROOT.is_dir():
+        for child in SESSIONS_ROOT.iterdir():
+            if not child.is_dir():
+                continue
+            entry = _session_list_entry(child)
+            if entry:
+                entries.append(entry)
+    entries.sort(key=lambda e: float(e.get("updated_at") or 0), reverse=True)
+    return JSONResponse({"sessions": entries})
 
 
 @app.get("/api/mashup/sessions/{session_id}")
 def get_session(session_id: str) -> JSONResponse:
-    session = SESSIONS_ROOT / session_id
-    meta = session / "metadata.json"
-    if not meta.is_file():
-        raise HTTPException(status_code=404, detail="Session not found")
-    return JSONResponse(json.loads(meta.read_text(encoding="utf-8")))
+    session = _session_dir(session_id)
+    meta = json.loads((session / "metadata.json").read_text(encoding="utf-8"))
+    return JSONResponse(meta)
 
 
-@app.post("/api/mashup/sessions/{session_id}/reassemble")
-async def reassemble(session_id: str, body: ReassembleBody) -> FileResponse:
-    session = SESSIONS_ROOT / session_id
-    if not (session / "metadata.json").is_file():
-        raise HTTPException(status_code=404, detail="Session not found")
+@app.get("/api/mashup/sessions/{session_id}/mashup")
+def get_session_mashup(session_id: str) -> FileResponse:
+    session = _session_dir(session_id)
+    path = session / "mashup.mp3"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Session mashup missing")
+    return FileResponse(path=str(path), media_type="audio/mpeg", filename="mashup.mp3")
 
-    out_dir = tempfile.mkdtemp(prefix="mashup_edit_", dir="/tmp")
-    out_path = Path(out_dir) / "mashup.mp3"
+
+@app.get("/api/mashup/sessions/{session_id}/studio")
+def get_studio(session_id: str) -> JSONResponse:
+    session = _session_dir(session_id)
+    try:
+        studio = load_studio(session)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(studio)
+
+
+@app.put("/api/mashup/sessions/{session_id}/studio")
+def put_studio(session_id: str, body: StudioPutBody) -> JSONResponse:
+    session = _session_dir(session_id)
+    if not isinstance(body.studio, dict) or "columns" not in body.studio:
+        raise HTTPException(status_code=400, detail="studio.columns required")
+    save_studio(session, body.studio)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/mashup/sessions/{session_id}/studio/commit-sections")
+def commit_sections(session_id: str, body: CommitSectionsBody) -> JSONResponse:
+    session = _session_dir(session_id)
+    try:
+        studio = load_studio(session)
+        studio = apply_committed_sections(
+            studio,
+            sections_a=body.sections_a,
+            sections_b=body.sections_b,
+        )
+        save_studio(session, studio)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(studio)
+
+
+@app.get("/api/mashup/sessions/{session_id}/song/{song}/audio")
+async def get_song_audio(
+    session_id: str,
+    song: Literal["a", "b"],
+) -> FileResponse:
+    session = _session_dir(session_id)
+    try:
+        path = await asyncio.to_thread(ensure_song_preview, session, song)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        path=str(path),
+        media_type="audio/mpeg",
+        filename=f"song_{song}_preview.mp3",
+    )
+
+
+@app.get("/api/mashup/sessions/{session_id}/song/{song}/section-preview")
+async def get_song_section_preview(
+    session_id: str,
+    song: Literal["a", "b"],
+    start: float = 0.0,
+    end: float = 1.0,
+) -> FileResponse:
+    session = _session_dir(session_id)
+    out_dir = tempfile.mkdtemp(prefix="sec_prev_", dir="/tmp")
+    out_path = Path(out_dir) / "section.mp3"
     try:
         await asyncio.to_thread(
-            reassemble_session,
-            session,
-            body.enabled_indices,
-            str(out_path),
+            extract_song_range, session, song, start, end, out_path
         )
     except Exception as exc:  # noqa: BLE001
         shutil.rmtree(out_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     return FileResponse(
         path=str(out_path),
         media_type="audio/mpeg",
-        filename="mashup.mp3",
+        filename=f"song_{song}_section.mp3",
         background=BackgroundTask(shutil.rmtree, out_dir, ignore_errors=True),
+    )
+
+
+@app.get("/api/mashup/sessions/{session_id}/clips/{song}/{stem}")
+async def get_clip(
+    session_id: str,
+    song: Literal["a", "b"],
+    stem: Literal["vocals", "drums", "bass", "other"],
+    section: int = 0,
+) -> FileResponse:
+    from services.audio import extract_audio_segment
+    from pydub import AudioSegment
+
+    session = _session_dir(session_id)
+    studio = load_studio(session)
+    sections = studio.get("sections_a" if song == "a" else "sections_b") or []
+    if not sections:
+        raise HTTPException(status_code=400, detail="No sections for song")
+    idx = int(section) % len(sections)
+    sec = sections[idx]
+    start = float(sec.get("start_sec", 0.0))
+    end = float(sec.get("end_sec", start + 1.0))
+    stem_dir = session / f"stems_{song}"
+    src = None
+    for ext in ("wav", "mp3"):
+        candidate = stem_dir / f"{stem}.{ext}"
+        if candidate.is_file():
+            src = candidate
+            break
+    if src is None:
+        raise HTTPException(status_code=404, detail=f"Stem missing: {song}/{stem}")
+
+    out_dir = tempfile.mkdtemp(prefix="clip_", dir="/tmp")
+    wav_out = Path(out_dir) / "clip.wav"
+    mp3_out = Path(out_dir) / "clip.mp3"
+    try:
+        await asyncio.to_thread(
+            extract_audio_segment, str(src), str(wav_out), start, end
+        )
+        await asyncio.to_thread(
+            lambda: AudioSegment.from_file(wav_out).export(str(mp3_out), format="mp3")
+        )
+    except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(
+        path=str(mp3_out),
+        media_type="audio/mpeg",
+        filename=f"{song}_{stem}_s{idx}.mp3",
+        background=BackgroundTask(shutil.rmtree, out_dir, ignore_errors=True),
+    )
+
+
+@app.post("/api/mashup/sessions/{session_id}/studio/preview")
+async def studio_preview(session_id: str, body: StudioPreviewBody) -> FileResponse:
+    session = _session_dir(session_id)
+    out_dir = tempfile.mkdtemp(prefix="studio_prev_", dir="/tmp")
+    out_path = Path(out_dir) / "preview.mp3"
+    try:
+        studio = load_studio(session)
+        await asyncio.to_thread(
+            render_studio,
+            session,
+            studio,
+            column_id=body.column_id,
+            output_path=out_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(
+        path=str(out_path),
+        media_type="audio/mpeg",
+        filename="preview.mp3",
+        background=BackgroundTask(shutil.rmtree, out_dir, ignore_errors=True),
+    )
+
+
+@app.post("/api/mashup/sessions/{session_id}/studio/render")
+async def studio_render(session_id: str) -> FileResponse:
+    session = _session_dir(session_id)
+    out_path = session / "mashup-edit.mp3"
+    try:
+        studio = load_studio(session)
+        await asyncio.to_thread(
+            render_studio, session, studio, output_path=out_path
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(
+        path=str(out_path),
+        media_type="audio/mpeg",
+        filename="mashup-edit.mp3",
     )
 
 
@@ -174,6 +425,7 @@ async def create_mashup(
     song_b: UploadFile = File(..., description="Second song audio file"),
     vocal_policy: VocalPolicyForm = Form("alternate"),
     creative_mode: CreativeMode = Form("forced_match"),
+    structure_mode: StructureMode = Form("allin1"),
     harmonic_weight: float = Form(0.6),
     rhythmic_weight: float = Form(0.25),
     spectral_weight: float = Form(0.15),
@@ -183,6 +435,8 @@ async def create_mashup(
         raise HTTPException(status_code=400, detail="Mashability weights must be >= 0")
     if harmonic_weight + rhythmic_weight + spectral_weight <= 0:
         raise HTTPException(status_code=400, detail="At least one mashability weight must be > 0")
+    if structure_mode not in ("allin1", "llm", "dsp"):
+        raise HTTPException(status_code=400, detail="Invalid structure_mode")
 
     weights = MashabilityWeights(
         harmonic=harmonic_weight,
@@ -208,11 +462,8 @@ async def create_mashup(
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(status_code=400, detail=f"Failed to save uploads: {exc}") from exc
 
-            stems_a_dir = work / "stems_a"
-            stems_b_dir = work / "stems_b"
-            stems_a_dir.mkdir()
-            stems_b_dir.mkdir()
-
+            demix_root = work / "demix"
+            demix_root.mkdir()
             title_a = Path(song_a.filename or "Song A").stem
             title_b = Path(song_b.filename or "Song B").stem
 
@@ -236,41 +487,63 @@ async def create_mashup(
                     blueprint = None
                     sections_a = None
                     sections_b = None
+                    form_a = form_b = None
+                    form_meta_a = form_meta_b = {}
+                    meter_a = meter_b = 4
+                    shift_a = shift_b = 0
+                    key_a = key_b = meeting_pc = None
+                    full_a = full_b = None
                     logger.info("Mashup decision: %s", decision.model_dump())
                     first_lead = "a" if decision.vocal_source == "song_a" else "b"
                     policy = _resolve_policy(vocal_policy, decision)
                 else:
-                    logger.info("Full Demucs stems for Song A anchor mashup")
+                    logger.info(
+                        "Full Demucs WAV stems (shared demix) structure_mode=%s",
+                        structure_mode,
+                    )
                     full_a = await asyncio.to_thread(
-                        separate_full_stems, str(song_a_path), str(stems_a_dir)
+                        separate_full_stems, str(song_a_path), str(demix_root)
                     )
                     full_b = await asyncio.to_thread(
-                        separate_full_stems, str(song_b_path), str(stems_b_dir)
+                        separate_full_stems, str(song_b_path), str(demix_root)
                     )
                     vocals_a = full_a.vocals
                     vocals_b = full_b.vocals
                     instr_a = full_a.instrumental
 
-                    # allin1 (or DSP fallback) structure on original uploads.
+                    # Ensure allin1 demix cache layout matches analyze input basenames.
+                    ensure_allin1_demix_layout(demix_root, song_a_path.stem, full_a)
+                    ensure_allin1_demix_layout(demix_root, song_b_path.stem, full_b)
+
                     struct_dir = work / "structure"
                     struct_dir.mkdir(exist_ok=True)
+                    shared_demix = demix_root if structure_mode == "allin1" else None
+
                     sections_a, form_a, form_meta_a = await asyncio.to_thread(
-                        resolve_sections_for_song,
-                        str(song_a_path),
-                        title_a,
-                        bpm_a,
-                        vocals_a,
+                        _resolve_structure,
+                        structure_mode,
+                        file_path=str(song_a_path),
+                        title=title_a,
+                        bpm=bpm_a,
+                        vocals_path=vocals_a,
                         work_dir=struct_dir / "a",
+                        demix_dir=shared_demix,
                     )
                     sections_b, form_b, form_meta_b = await asyncio.to_thread(
-                        resolve_sections_for_song,
-                        str(song_b_path),
-                        title_b,
-                        bpm_b,
-                        vocals_b,
+                        _resolve_structure,
+                        structure_mode,
+                        file_path=str(song_b_path),
+                        title=title_b,
+                        bpm=bpm_b,
+                        vocals_path=vocals_b,
                         work_dir=struct_dir / "b",
+                        demix_dir=shared_demix,
                     )
-                    # Prefer allin1 BPM when available.
+                    form_meta_a = dict(form_meta_a or {})
+                    form_meta_b = dict(form_meta_b or {})
+                    form_meta_a["structure_mode"] = structure_mode
+                    form_meta_b["structure_mode"] = structure_mode
+
                     if form_meta_a.get("structure_source") == "allin1" and form_meta_a.get(
                         "bpm"
                     ):
@@ -282,13 +555,14 @@ async def create_mashup(
                     meter_a = int(form_meta_a.get("meter_numerator") or 4)
                     meter_b = int(form_meta_b.get("meter_numerator") or 4)
                     logger.info(
-                        "Sections — A: %d (%s bpm=%.2f), B: %d (%s bpm=%.2f)",
+                        "Sections — A: %d (%s bpm=%.2f), B: %d (%s bpm=%.2f) mode=%s",
                         len(sections_a),
                         form_meta_a.get("structure_source") or form_meta_a.get("source"),
                         bpm_a,
                         len(sections_b),
                         form_meta_b.get("structure_source") or form_meta_b.get("source"),
                         bpm_b,
+                        structure_mode,
                     )
 
                     try:
@@ -344,10 +618,10 @@ async def create_mashup(
                 if creative_mode == "bassline":
                     logger.info("Full Demucs stems for bassline mode")
                     full_a = await asyncio.to_thread(
-                        separate_full_stems, str(song_a_path), str(stems_a_dir)
+                        separate_full_stems, str(song_a_path), str(demix_root)
                     )
                     full_b = await asyncio.to_thread(
-                        separate_full_stems, str(song_b_path), str(stems_b_dir)
+                        separate_full_stems, str(song_b_path), str(demix_root)
                     )
                     if decision.instrumental_source == "song_a":
                         drums_bed, other_bed = full_a.drums, full_a.other
@@ -369,7 +643,6 @@ async def create_mashup(
                         session_dir=session_dir,
                     )
                 else:
-                    # Song A is always the instrumental anchor bed.
                     result = await asyncio.to_thread(
                         build_dual_vocal_mashup,
                         vocals_a=vocals_a,
@@ -393,6 +666,9 @@ async def create_mashup(
                         key_a=key_a,
                         key_b=key_b,
                         meeting_pc=meeting_pc,
+                        drums_a=full_a.drums,
+                        bass_a=full_a.bass,
+                        other_a=full_a.other,
                         drums_b=full_b.drums,
                         bass_b=full_b.bass,
                         other_b=full_b.other,
@@ -419,6 +695,10 @@ async def create_mashup(
 
         metadata = dict(result.metadata)
         metadata["session_id"] = session_id
+        metadata["structure_mode"] = structure_mode
+        (session_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
+        )
         headers = {
             "X-Mashup-Session-Id": session_id,
             "X-Mashup-Metadata": _metadata_header(metadata),

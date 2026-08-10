@@ -341,6 +341,10 @@ def build_dual_vocal_mashup(
     key_a: str | None = None,
     key_b: str | None = None,
     meeting_pc: int | None = None,
+    # Optional Song A stems (for studio persistence).
+    drums_a: str | None = None,
+    bass_a: str | None = None,
+    other_a: str | None = None,
     # Optional Song B overlay stems.
     drums_b: str | None = None,
     bass_b: str | None = None,
@@ -392,6 +396,19 @@ def build_dual_vocal_mashup(
     pitched_voc_b = _pitch_shift_stem(
         vocals_b, str(work_dir / "vocals_b_pitched.wav"), shift_b
     )
+    a_stem_paths: dict[str, str] = {}
+    if drums_a:
+        a_stem_paths["drums"] = _pitch_shift_stem(
+            drums_a, str(work_dir / "drums_a_pitched.wav"), shift_a
+        )
+    if bass_a:
+        a_stem_paths["bass"] = _pitch_shift_stem(
+            bass_a, str(work_dir / "bass_a_pitched.wav"), shift_a
+        )
+    if other_a:
+        a_stem_paths["other"] = _pitch_shift_stem(
+            other_a, str(work_dir / "other_a_pitched.wav"), shift_a
+        )
     overlay_paths: dict[str, str] = {}
     if drums_b:
         overlay_paths["drums"] = _pitch_shift_stem(
@@ -424,6 +441,14 @@ def build_dual_vocal_mashup(
         bpm_b,
         stretch_bpm,
     )
+    stretched_a_stems: dict[str, str] = {}
+    for name, path_stem in a_stem_paths.items():
+        stretched_a_stems[name] = _stretch_to_bpm(
+            path_stem,
+            str(work_dir / f"{name}_a_stretched.wav"),
+            bpm_a,
+            stretch_bpm,
+        )
     stretched_overlays: dict[str, str] = {}
     for name, path_stem in overlay_paths.items():
         stretched_overlays[name] = _stretch_to_bpm(
@@ -779,6 +804,44 @@ def build_dual_vocal_mashup(
     meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     session_mashup = session_dir / "mashup.mp3"
     session_mashup.write_bytes(out.read_bytes())
+
+    # Persist pitch/BPM-aligned stems + seed Section editor grid (stretched clocks).
+    try:
+        from services.studio_mix import (
+            persist_aligned_stems,
+            save_studio,
+            seed_studio_from_metadata,
+        )
+
+        stems_a_map = {"vocals": stretched_a, "instrumental": stretched_instr}
+        stems_a_map.update(stretched_a_stems)
+        # If A drum/bass/other missing, derive placeholders from instrumental for studio.
+        if "drums" not in stems_a_map:
+            stems_a_map["drums"] = stretched_instr
+        if "bass" not in stems_a_map:
+            stems_a_map["bass"] = stretched_instr
+        if "other" not in stems_a_map:
+            stems_a_map["other"] = stretched_instr
+        stems_b_map = {"vocals": stretched_b}
+        stems_b_map.update(stretched_overlays)
+        for stem_name in ("drums", "bass", "other"):
+            if stem_name not in stems_b_map:
+                # Fall back to A bed so grid cells can still audition something.
+                stems_b_map[stem_name] = stretched_instr
+        persist_aligned_stems(session_dir, stems_a=stems_a_map, stems_b=stems_b_map)
+        studio_seed_meta = dict(metadata)
+        studio_seed_meta["sections_a"] = [
+            s.to_prompt_dict() for s in sections_a_stretched
+        ]
+        studio_seed_meta["sections_b"] = [
+            s.to_prompt_dict() for s in sections_b_stretched
+        ]
+        studio = seed_studio_from_metadata(studio_seed_meta)
+        save_studio(session_dir, studio)
+        metadata["studio_seeded"] = True
+        meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Studio asset persistence failed: %s", exc)
 
     return MashupResult(
         output_path=str(out),

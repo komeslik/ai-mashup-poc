@@ -615,8 +615,18 @@ def match_loudness(
     return match_loudness_lufs(source, reference, target_offset_db=target_offset_db)
 
 
-def fit_length(segment: AudioSegment, target_ms: int) -> AudioSegment:
-    """Trim or loop *segment* so its duration equals *target_ms*."""
+def fit_length(
+    segment: AudioSegment,
+    target_ms: int,
+    *,
+    loop: bool = True,
+) -> AudioSegment:
+    """
+    Trim or extend *segment* so its duration equals *target_ms*.
+
+    When shorter than the target: loop by default, or pad with silence if
+    ``loop=False`` (used for duration-locked studio columns).
+    """
     if target_ms <= 0:
         return segment
     if len(segment) == target_ms:
@@ -625,6 +635,13 @@ def fit_length(segment: AudioSegment, target_ms: int) -> AudioSegment:
         return segment[:target_ms]
     if len(segment) == 0:
         return AudioSegment.silent(duration=target_ms, frame_rate=segment.frame_rate)
+
+    if not loop:
+        pad = AudioSegment.silent(
+            duration=target_ms - len(segment),
+            frame_rate=segment.frame_rate,
+        ).set_channels(segment.channels)
+        return segment + pad
 
     pieces: list[AudioSegment] = []
     filled = 0

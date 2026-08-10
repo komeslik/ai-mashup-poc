@@ -183,9 +183,13 @@ def analyze_structure(
     vocals_path: str | None = None,
     work_dir: str | Path | None = None,
     fallback_bpm: float | None = None,
+    demix_dir: str | Path | None = None,
 ) -> StructureBundle:
     """
     Run allin1 on *file_path*; fall back to librosa ``detect_sections`` on failure.
+
+    When *demix_dir* already contains ``htdemucs/{stem}/*.wav`` matching the
+    analyze input basename, allin1 skips its internal Demucs pass.
     """
     import librosa
 
@@ -202,14 +206,16 @@ def analyze_structure(
         logger.info("allin1.analyze %s", path.name)
         cache_root = work or Path(tempfile.mkdtemp(prefix="allin1_cache_"))
         cache_root.mkdir(parents=True, exist_ok=True)
+        resolved_demix = Path(demix_dir) if demix_dir else (cache_root / "demix")
+        resolved_demix.mkdir(parents=True, exist_ok=True)
         # multiprocess=False: Pool workers break under uvicorn / macOS spawn.
         result = allin1.analyze(
             wav_path,
             device="cpu",
             multiprocess=False,
-            demix_dir=str(cache_root / "demix"),
+            demix_dir=str(resolved_demix),
             spec_dir=str(cache_root / "spec"),
-            keep_byproducts=bool(work),
+            keep_byproducts=bool(work) or demix_dir is not None,
         )
         bpm = float(getattr(result, "bpm", 0.0) or 0.0)
         if bpm <= 0 and fallback_bpm:
@@ -297,13 +303,15 @@ def resolve_sections_for_song(
     *,
     measured_duration_sec: float | None = None,
     work_dir: str | Path | None = None,
+    demix_dir: str | Path | None = None,
     **_ignored: Any,
 ) -> tuple[list[Section], dict[str, Any] | None, dict[str, Any]]:
     """
-    Drop-in replacement for the old LLM form resolver.
+    allin1 structure resolver.
 
     Returns (sections, form_dict_or_none, metadata).
-    ``form_dict`` mirrors a lightweight summary for UI (not LLM SongFormAnalysis).
+    ``form_dict`` mirrors a lightweight summary for UI.
+    Pass *demix_dir* with precomputed WAV stems to skip allin1's Demucs.
     """
     del measured_duration_sec  # allin1 uses the file itself
     bundle = analyze_structure(
@@ -311,6 +319,7 @@ def resolve_sections_for_song(
         vocals_path=vocals_path,
         work_dir=work_dir,
         fallback_bpm=bpm,
+        demix_dir=demix_dir,
     )
     form_summary: dict[str, Any] | None = {
         "title": title,
