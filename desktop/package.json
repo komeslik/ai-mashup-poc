@@ -1,0 +1,54 @@
+{
+  "name": "ai-mashup-poc",
+  "version": "0.3.0",
+  "description": "AI Song Mashup desktop shell (Windows-first)",
+  "main": "main.js",
+  "author": "ai-mashup-poc",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "pack": "electron-builder --dir",
+    "dist:win": "electron-builder --win --x64"
+  },
+  "build": {
+    "appId": "com.aimashup.poc",
+    "productName": "AI Song Mashup",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/sidecar",
+        "to": "sidecar",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "AI-Song-Mashup-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8"
+  }
+}

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import uuid
 from pathlib import Path
@@ -45,7 +46,29 @@ from services.studio_mix import (
     save_studio,
 )
 
-load_dotenv()
+
+def _runtime_base_dir() -> Path:
+    """Project root, or PyInstaller extract dir when frozen."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    return Path(__file__).resolve().parent
+
+
+def _default_sessions_root() -> Path:
+    override = (os.getenv("MASHUP_SESSIONS_ROOT") or "").strip()
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "ai-mashup-poc" / "sessions"
+    return Path("/tmp/mashup_sessions")
+
+
+# Prefer desktop-provided env file, then cwd/.env (localhost).
+_env_file = (os.getenv("MASHUP_ENV_FILE") or "").strip()
+if _env_file:
+    load_dotenv(_env_file, override=False)
+load_dotenv(override=False)
 
 # Hugging Face auth for allin1 / hub downloads.
 _hf = (os.getenv("HF_TOKEN") or os.getenv("HF_TOKEM") or "").strip()
@@ -61,9 +84,9 @@ if _hf:
 else:
     logger.info("HF token absent (public HF downloads only)")
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = _runtime_base_dir()
 STATIC_DIR = BASE_DIR / "static"
-SESSIONS_ROOT = Path("/tmp/mashup_sessions")
+SESSIONS_ROOT = _default_sessions_root()
 SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="AI Song Mashup API", version="0.3.0")
@@ -172,9 +195,22 @@ def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+def _allin1_available() -> bool:
+    try:
+        import allin1  # noqa: F401
+
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "desktop": (os.getenv("MASHUP_DESKTOP") or "").strip() in ("1", "true", "yes"),
+        "allin1_available": _allin1_available(),
+    }
 
 
 def _session_list_entry(session: Path) -> dict[str, Any] | None:
@@ -220,7 +256,7 @@ def _session_list_entry(session: Path) -> dict[str, Any] | None:
 
 @app.get("/api/mashup/sessions")
 def list_sessions() -> JSONResponse:
-    """List saved mashup sessions under /tmp/mashup_sessions."""
+    """List saved mashup sessions under the sessions root."""
     entries: list[dict[str, Any]] = []
     if SESSIONS_ROOT.is_dir():
         for child in SESSIONS_ROOT.iterdir():

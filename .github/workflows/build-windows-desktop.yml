@@ -1,0 +1,84 @@
+name: Build Windows Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "desktop/**"
+      - "desktop_server.py"
+      - "mashup-server.spec"
+      - "requirements-desktop-win.txt"
+      - "main.py"
+      - "services/**"
+      - "static/**"
+      - ".github/workflows/build-windows-desktop.yml"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-desktop-win.txt
+
+      - name: Install Python deps + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-desktop-win.txt
+
+      - name: Build sidecar (PyInstaller)
+        run: |
+          python -m PyInstaller mashup-server.spec --noconfirm --clean
+
+      - name: Stage sidecar + ffmpeg
+        shell: pwsh
+        run: |
+          $OutDir = "desktop/resources/sidecar"
+          New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+          Copy-Item -Recurse -Force "dist/mashup-server/*" $OutDir
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_dl -Force
+          $ff = Get-ChildItem -Path ffmpeg_dl -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $ff) { throw "ffmpeg.exe not found in download" }
+          Copy-Item -Force $ff.FullName "$OutDir/ffmpeg.exe"
+          # Shared DLLs next to ffmpeg help some builds
+          $binDir = $ff.Directory.FullName
+          Get-ChildItem "$binDir/*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination $OutDir -Force
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install Electron deps
+        working-directory: desktop
+        run: npm ci
+
+      - name: Verify sidecar binary exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "desktop/resources/sidecar/mashup-server.exe")) {
+            throw "mashup-server.exe missing from sidecar staging"
+          }
+
+      - name: Build Windows installer
+        working-directory: desktop
+        run: npm run dist:win
+        env:
+          # Unsigned private share is fine for friend demos.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Song-Mashup-Windows
+          path: desktop/dist/*.exe
+          if-no-files-found: error
+          retention-days: 14

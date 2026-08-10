@@ -1791,12 +1791,37 @@
     sessionBackdrop.addEventListener("click", closeSessionDrawer);
   }
 
+  async function adaptStructureModesFromHealth() {
+    if (!structureMode) return;
+    try {
+      const response = await fetch("/health");
+      if (!response.ok) return;
+      const data = await response.json();
+      const allin1Ok = Boolean(data.allin1_available);
+      const allin1Option = structureMode.querySelector('option[value="allin1"]');
+      if (!allin1Ok && allin1Option) {
+        allin1Option.disabled = true;
+        allin1Option.textContent = "allin1 (not bundled on this build)";
+        if (structureMode.value === "allin1") structureMode.value = "llm";
+      }
+      if (data.desktop && structureMode.value === "allin1" && !allin1Ok) {
+        structureMode.value = "llm";
+      }
+    } catch {
+      /* ignore — localhost without server mid-load */
+    }
+  }
+
   const params = new URLSearchParams(window.location.search);
   const hydrateId = params.get("session");
-  if (hydrateId) {
-    hydrateSession(hydrateId).catch((err) => {
-      showError(err instanceof Error ? err.message : "Failed to restore session");
-      statusPanel.hidden = false;
+  adaptStructureModesFromHealth()
+    .catch(() => {})
+    .finally(() => {
+      if (hydrateId) {
+        hydrateSession(hydrateId).catch((err) => {
+          showError(err instanceof Error ? err.message : "Failed to restore session");
+          statusPanel.hidden = false;
+        });
+      }
     });
-  }
 })();

@@ -158,6 +158,7 @@ source .venv/bin/activate
 uvicorn main:app --reload --port 8000
 ```
 
+Want a **Windows `.exe` for a friend**? See [DESKTOP.md](DESKTOP.md) (Electron + CI build). Localhost above stays the primary Mac workflow.
 | URL | What |
 |-----|------|
 | http://127.0.0.1:8000/ | Web UI |

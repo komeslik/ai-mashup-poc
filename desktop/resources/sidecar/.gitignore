@@ -1,0 +1,4 @@
+# Sidecar binaries for Electron (gitignored).
+# CI / build_sidecar_win.ps1 populates this folder.
+*
+!.gitignore

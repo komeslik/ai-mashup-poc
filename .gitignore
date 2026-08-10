@@ -44,6 +44,15 @@ tmp/
 temp/
 /tmp/
 
+# Electron / desktop packaging
+desktop/node_modules/
+desktop/dist/
+desktop/resources/sidecar/**
+!desktop/resources/sidecar/.gitignore
+dist/mashup-server/
+*.spec.bak
+
+
 # Local track library (audio stays on disk; keep the readme)
 library/**
 !library/README.txt
