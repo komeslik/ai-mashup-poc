@@ -20,6 +20,22 @@ logger = logging.getLogger(__name__)
 STEMS = ("vocals", "drums", "bass", "other")
 SongKey = Literal["a", "b"]
 
+# Distinct colors for source sections (hex).
+SECTION_PALETTE = (
+    "#6ee7b7",
+    "#93c5fd",
+    "#f9a8d4",
+    "#fcd34d",
+    "#c4b5fd",
+    "#fdba74",
+    "#67e8f9",
+    "#fca5a5",
+    "#a3e635",
+    "#dda0dd",
+    "#7dd3fc",
+    "#fde68a",
+)
+
 
 def _cell_key(song: str, stem: str) -> str:
     return f"{song}:{stem}"
@@ -29,11 +45,39 @@ def empty_cell() -> dict[str, Any]:
     return {"enabled": False, "source_section_index": 0}
 
 
+def enrich_sections_display(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Add stable display_label (verse1, verse2, …) and color to each section dict.
+
+    Mutates and returns the list.
+    """
+    counts: dict[str, int] = {}
+    totals: dict[str, int] = {}
+    for sec in sections:
+        base = str(sec.get("label") or sec.get("name") or "section").strip().lower()
+        base = "".join(ch for ch in base if ch.isalnum() or ch in ("_", "-")) or "section"
+        totals[base] = totals.get(base, 0) + 1
+    for i, sec in enumerate(sections):
+        base = str(sec.get("label") or sec.get("name") or "section").strip().lower()
+        base = "".join(ch for ch in base if ch.isalnum() or ch in ("_", "-")) or "section"
+        counts[base] = counts.get(base, 0) + 1
+        if totals.get(base, 1) > 1:
+            display = f"{base}{counts[base]}"
+        else:
+            display = base
+        sec["display_label"] = display
+        if not sec.get("color"):
+            sec["color"] = SECTION_PALETTE[i % len(SECTION_PALETTE)]
+        if not sec.get("name"):
+            sec["name"] = display
+    return sections
+
+
 def seed_studio_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     """Build studio.json grid from auto-mashup phrases / sections."""
     phrases = list(metadata.get("phrases") or [])
-    sections_a = list(metadata.get("sections_a") or [])
-    sections_b = list(metadata.get("sections_b") or [])
+    sections_a = enrich_sections_display(list(metadata.get("sections_a") or []))
+    sections_b = enrich_sections_display(list(metadata.get("sections_b") or []))
     title_a = (
         (metadata.get("form_a") or {}).get("title")
         or (metadata.get("structure_a") or {}).get("title")
@@ -129,7 +173,10 @@ def seed_studio_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 def load_studio(session_dir: Path) -> dict[str, Any]:
     path = session_dir / "studio.json"
     if path.is_file():
-        return json.loads(path.read_text(encoding="utf-8"))
+        studio = json.loads(path.read_text(encoding="utf-8"))
+        studio["sections_a"] = enrich_sections_display(list(studio.get("sections_a") or []))
+        studio["sections_b"] = enrich_sections_display(list(studio.get("sections_b") or []))
+        return studio
     meta_path = session_dir / "metadata.json"
     if not meta_path.is_file():
         raise FileNotFoundError("Session metadata missing")
@@ -141,7 +188,111 @@ def load_studio(session_dir: Path) -> dict[str, Any]:
 
 def save_studio(session_dir: Path, studio: dict[str, Any]) -> None:
     path = session_dir / "studio.json"
+    studio = dict(studio)
+    studio["sections_a"] = enrich_sections_display(list(studio.get("sections_a") or []))
+    studio["sections_b"] = enrich_sections_display(list(studio.get("sections_b") or []))
     path.write_text(json.dumps(studio, indent=2), encoding="utf-8")
+
+
+def ensure_song_preview(session_dir: Path, song: SongKey) -> Path:
+    """Mix four stems into song_{a|b}_preview.mp3 for waveforms / audition."""
+    session = Path(session_dir)
+    out = session / f"song_{song}_preview.mp3"
+    if out.is_file() and out.stat().st_size > 0:
+        return out
+    layers: list[AudioSegment] = []
+    for stem in STEMS:
+        try:
+            path = _stem_path(session, song, stem)
+        except FileNotFoundError:
+            continue
+        try:
+            layers.append(AudioSegment.from_file(path))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Preview stem load failed %s/%s: %s", song, stem, exc)
+    if not layers:
+        raise FileNotFoundError(f"No stems for song {song} preview")
+    canvas = layers[0]
+    for layer in layers[1:]:
+        # Overlay at equal gain; pad shorter layers implicitly via overlay.
+        if len(layer) > len(canvas):
+            canvas = canvas + AudioSegment.silent(
+                duration=len(layer) - len(canvas), frame_rate=canvas.frame_rate
+            )
+        canvas = canvas.overlay(layer)
+    canvas.export(str(out), format="mp3")
+    return out
+
+
+def extract_song_range(
+    session_dir: Path,
+    song: SongKey,
+    start_sec: float,
+    end_sec: float,
+    output_path: Path,
+) -> Path:
+    """Export a time range of the song preview (builds preview if needed)."""
+    preview = ensure_song_preview(session_dir, song)
+    start = max(0.0, float(start_sec))
+    end = max(start + 0.05, float(end_sec))
+    seg = AudioSegment.from_file(preview)
+    start_ms = int(start * 1000)
+    end_ms = min(len(seg), int(end * 1000))
+    clip = seg[start_ms:end_ms]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    clip.export(str(output_path), format="mp3")
+    return output_path
+
+
+def apply_committed_sections(
+    studio: dict[str, Any],
+    *,
+    sections_a: list[dict[str, Any]] | None = None,
+    sections_b: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """
+    Replace source section maps and rescale mashup column durations when a
+    column's Song A bed section length changed.
+    """
+    old_a = list(studio.get("sections_a") or [])
+    old_b = list(studio.get("sections_b") or [])
+    if sections_a is not None:
+        studio["sections_a"] = enrich_sections_display(list(sections_a))
+    else:
+        studio["sections_a"] = enrich_sections_display(old_a)
+    if sections_b is not None:
+        studio["sections_b"] = enrich_sections_display(list(sections_b))
+    else:
+        studio["sections_b"] = enrich_sections_display(old_b)
+
+    new_a = studio["sections_a"]
+    new_b = studio["sections_b"]
+
+    def _dur(secs: list[dict[str, Any]], idx: int) -> float:
+        if not secs:
+            return 0.0
+        sec = secs[int(idx) % len(secs)]
+        return max(0.0, float(sec.get("end_sec", 0)) - float(sec.get("start_sec", 0)))
+
+    for column in studio.get("columns") or []:
+        cells = column.get("cells") or {}
+        # Prefer Song A drums bed as length reference (matches seed).
+        bed = cells.get(_cell_key("a", "drums")) or {}
+        if not bed.get("enabled"):
+            bed = cells.get(_cell_key("a", "other")) or bed
+        if not bed.get("enabled"):
+            continue
+        idx = int(bed.get("source_section_index") or 0)
+        old_len = _dur(old_a, idx)
+        new_len = _dur(new_a, idx)
+        if old_len > 0.05 and new_len > 0.05:
+            scale = new_len / old_len
+            cur = int(column.get("duration_ms") or 0)
+            if cur > 0:
+                column["duration_ms"] = max(250, int(round(cur * scale)))
+            else:
+                column["duration_ms"] = max(250, int(round(new_len * 1000)))
+    return studio
 
 
 def _section_window(sections: list[dict[str, Any]], index: int) -> tuple[float, float]:
@@ -154,6 +305,41 @@ def _section_window(sections: list[dict[str, Any]], index: int) -> tuple[float, 
     if end <= start:
         end = start + 0.5
     return start, end
+
+
+def _cell_source_duration_ms(sections: list[dict[str, Any]], index: int) -> int:
+    start, end = _section_window(sections, index)
+    return max(250, int(round((end - start) * 1000)))
+
+
+def column_mix_duration_ms(
+    column: dict[str, Any],
+    sections_a: list[dict[str, Any]],
+    sections_b: list[dict[str, Any]],
+) -> int:
+    """
+    Column length = max(stored duration, longest enabled source section).
+
+    Shorter stems are looped to fill this window (see ``fit_length``).
+    """
+    cells = column.get("cells") or {}
+    lengths: list[int] = []
+    sections_map = {"a": sections_a, "b": sections_b}
+    for song in ("a", "b"):
+        for stem in STEMS:
+            cell = cells.get(_cell_key(song, stem)) or cells.get(f"{song}_{stem}")
+            if not cell or not cell.get("enabled"):
+                continue
+            lengths.append(
+                _cell_source_duration_ms(
+                    sections_map[song], int(cell.get("source_section_index") or 0)
+                )
+            )
+    stored = int(column.get("duration_ms") or 0)
+    if lengths:
+        natural = max(lengths)
+        return max(stored, natural) if stored > 0 else natural
+    return stored or 4000
 
 
 def _stem_path(session_dir: Path, song: str, stem: str) -> Path:
@@ -196,7 +382,6 @@ def render_studio(
     work.mkdir(exist_ok=True)
 
     for col_i, column in enumerate(columns):
-        duration_ms = int(column.get("duration_ms") or 0)
         cells = column.get("cells") or {}
         frame_rate = 44100
         channels = 2
@@ -226,8 +411,16 @@ def render_studio(
                 channels = seg.channels or channels
                 layers.append(seg)
 
+        # Stay on this mashup section until the longest enabled source finishes;
+        # shorter sources are looped via fit_length.
+        duration_ms = column_mix_duration_ms(column, sections_a, sections_b)
+        if layers:
+            duration_ms = max(duration_ms, max(len(s) for s in layers))
         if duration_ms <= 0:
-            duration_ms = max((len(s) for s in layers), default=4000)
+            duration_ms = 4000
+        # Keep studio.json / UI in sync with effective mix length.
+        column["duration_ms"] = int(duration_ms)
+
         canvas = AudioSegment.silent(duration=duration_ms, frame_rate=frame_rate).set_channels(
             channels
         )
@@ -247,6 +440,12 @@ def render_studio(
     out = Path(output_path) if output_path else (session / "mashup-edit.mp3")
     out.parent.mkdir(parents=True, exist_ok=True)
     combined.export(str(out), format="mp3")
+    # Persist any duration_ms updates from max-source logic.
+    if studio is not None and not column_id:
+        try:
+            save_studio(session, studio)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not persist updated column durations: %s", exc)
     return str(out)
 
 
@@ -269,6 +468,15 @@ def persist_aligned_stems(
             target = dest / f"{name}{src_path.suffix.lower() or '.wav'}"
             if src_path.resolve() != target.resolve():
                 shutil.copy2(src_path, target)
+    # Invalidate / rebuild song previews after stem copy.
+    for song in ("a", "b"):
+        preview = session_dir / f"song_{song}_preview.mp3"
+        if preview.is_file():
+            preview.unlink(missing_ok=True)
+        try:
+            ensure_song_preview(session_dir, song)  # type: ignore[arg-type]
+        except FileNotFoundError:
+            logger.warning("Could not build song_%s_preview", song)
 
 
 def sections_from_prompt_dicts(rows: list[dict[str, Any]]) -> list[Section]:

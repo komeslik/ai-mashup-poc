@@ -25,10 +25,17 @@
   const studioBoard = document.getElementById("studio-board");
   const studioPlayhead = document.getElementById("studio-playhead");
   const studioPlay = document.getElementById("studio-play");
+  const studioSkip = document.getElementById("studio-skip");
   const studioDownload = document.getElementById("studio-download");
   const studioAudio = document.getElementById("studio-audio");
+  const sectionPreviewAudio = document.getElementById("section-preview-audio");
   const studioTime = document.getElementById("studio-time");
   const arrangementHint = document.getElementById("arrangement-hint");
+  const commitSectionsBtn = document.getElementById("commit-sections");
+  const studioWaveforms = document.getElementById("studio-waveforms");
+  const LABEL_W = 120;
+  const PX_PER_SEC = 40;
+  const MIN_SECTION_SEC = 0.25;
 
   const STEMS = [
     { id: "vocals", label: "vocals" },
@@ -46,11 +53,25 @@
   /** @type {string | null} */
   let studioObjectUrl = null;
   /** @type {string | null} */
+  let sectionPreviewUrl = null;
+  /** @type {{ song: string, index: number, start: number, end: number } | null} */
+  let activeSectionPreview = null;
+  /** @type {string | null} */
   let sessionId = null;
   /** @type {object | null} */
   let mashupMeta = null;
   /** @type {object | null} */
   let studioState = null;
+  let studioDirty = true;
+  let studioAudioReady = false;
+  let playheadTimeSec = 0;
+  let studioBusy = false;
+  let studioRerenderToken = 0;
+
+  /** @type {{ a: object[] | null, b: object[] | null }} */
+  let pendingSections = { a: null, b: null };
+  /** @type {{ a: Float32Array | null, b: Float32Array | null, aDur: number, bDur: number }} */
+  let wavePeaks = { a: null, b: null, aDur: 0, bDur: 0 };
 
   const STAGE_MESSAGES = [
     "Uploading tracks…",
@@ -168,18 +189,209 @@
     return `${song}:${stem}`;
   }
 
+  function cloneSections(sections) {
+    return (sections || []).map((s) => ({ ...s }));
+  }
+
+  function sectionsForSong(song) {
+    if (song === "a") {
+      return pendingSections.a || studioState?.sections_a || [];
+    }
+    return pendingSections.b || studioState?.sections_b || [];
+  }
+
+  function sectionDisplayLabel(sec, index) {
+    if (!sec) return `§${index}`;
+    return sec.display_label || sec.name || sec.label || `§${index}`;
+  }
+
   function sectionLabel(sections, index) {
     if (!sections || !sections.length) return `§${index}`;
     const sec = sections[index % sections.length];
-    return sec.name || sec.label || `§${index}`;
+    return sectionDisplayLabel(sec, index);
+  }
+
+  function sectionColor(sections, index) {
+    if (!sections || !sections.length) return "#6ee7b7";
+    const sec = sections[index % sections.length];
+    return sec.color || "#6ee7b7";
+  }
+
+  function sectionDurationMs(sections, index) {
+    if (!sections || !sections.length) return 4000;
+    const sec = sections[index % sections.length];
+    const start = Number(sec.start_sec) || 0;
+    const end = Number(sec.end_sec) || start + 4;
+    return Math.max(250, Math.round((end - start) * 1000));
+  }
+
+  function columnEffectiveDurationMs(col) {
+    if (!studioState || !col) return Number(col?.duration_ms) || 4000;
+    const sectionsA = sectionsForSong("a");
+    const sectionsB = sectionsForSong("b");
+    const lengths = [];
+    const cells = col.cells || {};
+    for (const song of ["a", "b"]) {
+      const sections = song === "a" ? sectionsA : sectionsB;
+      for (const stem of STEMS) {
+        const data = cells[cellKey(song, stem.id)];
+        if (!data || !data.enabled) continue;
+        lengths.push(
+          sectionDurationMs(sections, Number(data.source_section_index) || 0)
+        );
+      }
+    }
+    const stored = Number(col.duration_ms) || 0;
+    if (lengths.length) {
+      const natural = Math.max(...lengths);
+      return stored > 0 ? Math.max(stored, natural) : natural;
+    }
+    return stored || 4000;
+  }
+
+  function totalTimelineMs() {
+    if (!studioState?.columns) return 0;
+    return studioState.columns.reduce(
+      (sum, col) => sum + columnEffectiveDurationMs(col),
+      0
+    );
   }
 
   function columnWidths() {
     if (!studioState || !studioState.columns) return [];
     return studioState.columns.map((col) => {
-      const ms = Number(col.duration_ms) || 4000;
+      const ms = columnEffectiveDurationMs(col);
       return Math.max(96, Math.round(ms / 40));
     });
+  }
+
+  function markStudioDirty() {
+    studioDirty = true;
+    studioAudioReady = false;
+  }
+
+  function setRenderingUi(on) {
+    if (!studioPlay) return;
+    studioPlay.classList.toggle("rendering", on);
+    const playIcon = studioPlay.querySelector(".icon-play");
+    const pauseIcon = studioPlay.querySelector(".icon-pause");
+    const spinner = studioPlay.querySelector(".icon-spinner");
+    if (spinner) spinner.hidden = !on;
+    if (on) {
+      if (playIcon) playIcon.hidden = true;
+      if (pauseIcon) pauseIcon.hidden = true;
+      studioPlay.title = "Rendering…";
+      studioPlay.setAttribute("aria-label", "Rendering");
+      studioPlay.disabled = true;
+    } else {
+      studioPlay.disabled = false;
+      setPlayIcons(!studioAudio.paused && !!studioAudio.src);
+    }
+  }
+
+  function setPlayIcons(playing) {
+    if (!studioPlay) return;
+    if (studioPlay.classList.contains("rendering")) return;
+    const playIcon = studioPlay.querySelector(".icon-play");
+    const pauseIcon = studioPlay.querySelector(".icon-pause");
+    const spinner = studioPlay.querySelector(".icon-spinner");
+    if (spinner) spinner.hidden = true;
+    if (playIcon) playIcon.hidden = playing;
+    if (pauseIcon) pauseIcon.hidden = !playing;
+    studioPlay.title = playing ? "Pause" : "Play";
+    studioPlay.setAttribute("aria-label", playing ? "Pause" : "Play");
+  }
+
+  /**
+   * After a grid cell/column edit: freeze playhead, pause, show spinner,
+   * re-render preview, then resume from the frozen ticker if it was playing.
+   */
+  async function afterStudioGridEdit() {
+    if (!sessionId || !studioState) return;
+    if (studioAudio.src && Number.isFinite(studioAudio.currentTime)) {
+      playheadTimeSec = studioAudio.currentTime;
+    }
+    const resumeAfter = Boolean(studioAudio.src && !studioAudio.paused);
+    studioAudio.pause();
+    setPlayIcons(false);
+    setPlayheadVisual(playheadTimeSec);
+
+    markStudioDirty();
+    const token = ++studioRerenderToken;
+    setRenderingUi(true);
+    studioBusy = true;
+    try {
+      await persistStudio();
+      await ensureStudioPreviewLoaded();
+      if (token !== studioRerenderToken) return;
+      const max = studioAudio.duration || 0;
+      const seekTo = Math.max(0, Math.min(playheadTimeSec, max || playheadTimeSec));
+      studioAudio.currentTime = seekTo;
+      playheadTimeSec = seekTo;
+      setPlayheadVisual(playheadTimeSec);
+      if (resumeAfter) {
+        await studioAudio.play();
+        setPlayIcons(true);
+      }
+    } catch (err) {
+      if (token === studioRerenderToken) {
+        showError(err instanceof Error ? err.message : "Studio preview failed.");
+        setPlayIcons(false);
+      }
+    } finally {
+      if (token === studioRerenderToken) {
+        setRenderingUi(false);
+        studioBusy = false;
+      }
+    }
+  }
+
+  function setPlayheadVisual(timeSec) {
+    if (!studioPlayhead || !studioState) return;
+    const widths = columnWidths();
+    const totalMs = totalTimelineMs();
+    const totalW = widths.reduce((a, b) => a + b, 0);
+    const ratio = totalMs > 0 ? (timeSec * 1000) / totalMs : 0;
+    const x = LABEL_W + Math.max(0, Math.min(1, ratio)) * totalW;
+    studioPlayhead.style.transform = `translateX(${x}px)`;
+    studioPlayhead.hidden = false;
+    const dur =
+      studioAudioReady && studioAudio.duration
+        ? studioAudio.duration
+        : totalMs / 1000;
+    if (studioTime) {
+      studioTime.textContent = `${formatTime(timeSec)} / ${formatTime(dur || 0)}`;
+    }
+  }
+
+  function seekPlayheadToTime(timeSec, { resumeIfPlaying = true } = {}) {
+    const totalMs = totalTimelineMs();
+    const maxSec =
+      studioAudioReady && studioAudio.duration
+        ? studioAudio.duration
+        : totalMs / 1000;
+    const t = Math.max(0, Math.min(maxSec || 0, timeSec));
+    playheadTimeSec = t;
+    setPlayheadVisual(t);
+    if (studioAudioReady && studioAudio.src) {
+      const wasPlaying = !studioAudio.paused;
+      studioAudio.currentTime = t;
+      if (resumeIfPlaying && wasPlaying) {
+        studioAudio.play().catch(() => {});
+      }
+    }
+  }
+
+  function timeFromClientX(clientX) {
+    if (!studioBoard) return 0;
+    const rect = studioBoard.getBoundingClientRect();
+    const x = clientX - rect.left - LABEL_W;
+    const widths = columnWidths();
+    const totalW = widths.reduce((a, b) => a + b, 0);
+    if (totalW <= 0) return 0;
+    const clamped = Math.max(0, Math.min(totalW, x));
+    const totalMs = totalTimelineMs();
+    return (clamped / totalW) * (totalMs / 1000);
   }
 
   async function persistStudio() {
@@ -218,14 +430,20 @@
     };
     studioState.columns.splice(atIndex, 0, col);
     renderStudioGrid();
-    persistStudio();
+    afterStudioGridEdit();
+  }
+
+  function removeColumn(index) {
+    if (!studioState || studioState.columns.length <= 1) return;
+    studioState.columns.splice(index, 1);
+    renderStudioGrid();
+    afterStudioGridEdit();
   }
 
   function openSectionPicker(song, stemId, colIndex, anchorEl) {
     const existing = document.querySelector(".studio-picker");
     if (existing) existing.remove();
-    const sections =
-      song === "a" ? studioState.sections_a || [] : studioState.sections_b || [];
+    const sections = sectionsForSong(song);
     const picker = document.createElement("div");
     picker.className = "studio-picker";
     const off = document.createElement("button");
@@ -239,13 +457,19 @@
       };
       picker.remove();
       renderStudioGrid();
-      persistStudio();
+      afterStudioGridEdit();
     });
     picker.appendChild(off);
     sections.forEach((sec, i) => {
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.textContent = sec.name || sec.label || `Section ${i}`;
+      const swatch = document.createElement("span");
+      swatch.className = "swatch";
+      swatch.style.background = sec.color || "#6ee7b7";
+      btn.appendChild(swatch);
+      btn.appendChild(
+        document.createTextNode(sectionDisplayLabel(sec, i))
+      );
       btn.addEventListener("click", () => {
         const key = cellKey(song, stemId);
         studioState.columns[colIndex].cells[key] = {
@@ -254,7 +478,7 @@
         };
         picker.remove();
         renderStudioGrid();
-        persistStudio();
+        afterStudioGridEdit();
       });
       picker.appendChild(btn);
     });
@@ -274,11 +498,10 @@
   function renderStudioGrid() {
     if (!studioBoard || !studioState) return;
     const widths = columnWidths();
-    const totalWidth = widths.reduce((a, b) => a + b, 0) + 120;
+    const totalWidth = widths.reduce((a, b) => a + b, 0) + LABEL_W;
     studioBoard.style.width = `${totalWidth}px`;
     studioBoard.innerHTML = "";
     if (studioPlayhead) {
-      studioPlayhead.hidden = true;
       studioBoard.appendChild(studioPlayhead);
     }
 
@@ -292,17 +515,34 @@
       const cell = document.createElement("div");
       cell.className = "studio-col-head";
       cell.style.width = `${widths[i]}px`;
-      cell.textContent = col.label || `Sec ${i + 1}`;
-      const edge = document.createElement("button");
-      edge.type = "button";
-      edge.className = "studio-edge-add";
-      edge.title = "Insert section";
-      edge.textContent = "+";
-      edge.addEventListener("click", (event) => {
+      const title = document.createElement("span");
+      title.textContent = col.label || `Sec ${i + 1}`;
+      cell.appendChild(title);
+
+      const controls = document.createElement("div");
+      controls.className = "studio-edge-controls";
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "studio-edge-remove";
+      removeBtn.title = "Remove section";
+      removeBtn.textContent = "−";
+      removeBtn.disabled = studioState.columns.length <= 1;
+      removeBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        removeColumn(i);
+      });
+      const addBtn = document.createElement("button");
+      addBtn.type = "button";
+      addBtn.className = "studio-edge-add";
+      addBtn.title = "Insert section";
+      addBtn.textContent = "+";
+      addBtn.addEventListener("click", (event) => {
         event.stopPropagation();
         insertColumn(i + 1);
       });
-      cell.appendChild(edge);
+      controls.appendChild(removeBtn);
+      controls.appendChild(addBtn);
+      cell.appendChild(controls);
       header.appendChild(cell);
     });
     studioBoard.appendChild(header);
@@ -323,7 +563,12 @@
       group.className = "studio-group";
       const groupLabel = document.createElement("div");
       groupLabel.className = "studio-group-label";
+      groupLabel.style.width = `${totalWidth}px`;
       groupLabel.textContent = song.title;
+      groupLabel.addEventListener("click", (event) => {
+        const t = timeFromClientX(event.clientX);
+        seekPlayheadToTime(t, { resumeIfPlaying: true });
+      });
       group.appendChild(groupLabel);
 
       for (const stem of STEMS) {
@@ -344,13 +589,17 @@
           cell.type = "button";
           cell.className = `studio-cell${data.enabled ? " on" : " off"}`;
           cell.style.width = `${widths[colIndex]}px`;
-          const sections =
-            song.id === "a"
-              ? studioState.sections_a || []
-              : studioState.sections_b || [];
-          cell.textContent = data.enabled
-            ? sectionLabel(sections, data.source_section_index)
-            : "—";
+          const sections = sectionsForSong(song.id);
+          if (data.enabled) {
+            cell.textContent = sectionLabel(sections, data.source_section_index);
+            cell.style.boxShadow = `inset 3px 0 0 ${sectionColor(
+              sections,
+              data.source_section_index
+            )}`;
+          } else {
+            cell.textContent = "—";
+            cell.style.boxShadow = "";
+          }
           cell.addEventListener("click", () =>
             openSectionPicker(song.id, stem.id, colIndex, cell)
           );
@@ -361,6 +610,450 @@
       studioBoard.appendChild(group);
     }
     sectionEditor.hidden = false;
+    setPlayheadVisual(playheadTimeSec);
+  }
+
+  function updateCommitButton() {
+    if (!commitSectionsBtn) return;
+    const dirty =
+      pendingSections.a !== null || pendingSections.b !== null;
+    commitSectionsBtn.hidden = !dirty;
+  }
+
+  function songDuration(song) {
+    if (song === "a") return wavePeaks.aDur || 0;
+    return wavePeaks.bDur || 0;
+  }
+
+  function drawWaveform(song) {
+    const canvas = document.getElementById(`wave-canvas-${song}`);
+    const track = document.getElementById(`wave-track-${song}`);
+    const peaks = wavePeaks[song];
+    const dur = songDuration(song);
+    if (!canvas || !track || !peaks || !dur) return;
+    const width = Math.max(400, Math.round(dur * PX_PER_SEC));
+    track.style.width = `${width}px`;
+    canvas.width = width;
+    canvas.height = 64;
+    canvas.style.width = `${width}px`;
+    canvas.style.height = "64px";
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, width, 64);
+    ctx.fillStyle = "rgba(214, 245, 120, 0.08)";
+    ctx.fillRect(0, 0, width, 64);
+    ctx.fillStyle = "rgba(214, 245, 120, 0.55)";
+    const mid = 32;
+    for (let x = 0; x < width; x += 1) {
+      const idx = Math.floor((x / width) * peaks.length);
+      const amp = peaks[idx] || 0;
+      const h = Math.max(1, amp * 28);
+      ctx.fillRect(x, mid - h, 1, h * 2);
+    }
+  }
+
+  function renderWaveRegions(song) {
+    const host = document.getElementById(`wave-regions-${song}`);
+    const track = document.getElementById(`wave-track-${song}`);
+    if (!host || !track) return;
+    const savedProgress =
+      activeSectionPreview && activeSectionPreview.song === song
+        ? sectionPreviewAudio.currentTime || 0
+        : 0;
+    host.innerHTML = "";
+    const sections = sectionsForSong(song);
+    const dur =
+      songDuration(song) ||
+      Math.max(...sections.map((s) => Number(s.end_sec) || 0), 1);
+    const width = Math.max(400, Math.round(dur * PX_PER_SEC));
+    track.style.width = `${width}px`;
+
+    sections.forEach((sec, i) => {
+      const start = Number(sec.start_sec) || 0;
+      const end = Number(sec.end_sec) || start + 1;
+      const left = (start / dur) * width;
+      const w = Math.max(4, ((end - start) / dur) * width);
+      const region = document.createElement("div");
+      region.className = "wave-region";
+      region.dataset.song = song;
+      region.dataset.index = String(i);
+      region.style.left = `${left}px`;
+      region.style.width = `${w}px`;
+      region.style.setProperty("--sec-color", sec.color || "#6ee7b7");
+
+      const wrap = document.createElement("div");
+      wrap.className = "wave-play-wrap";
+      const nameEl = document.createElement("span");
+      nameEl.className = "wave-sec-name";
+      nameEl.textContent = sectionDisplayLabel(sec, i);
+      const playBtn = document.createElement("button");
+      playBtn.type = "button";
+      playBtn.className = "wave-play";
+      const isActive =
+        activeSectionPreview &&
+        activeSectionPreview.song === song &&
+        activeSectionPreview.index === i;
+      const isPlaying = isActive && !sectionPreviewAudio.paused;
+      playBtn.textContent = isPlaying ? "❚❚" : "▶";
+      playBtn.title = isPlaying ? "Pause section" : "Play section";
+      playBtn.setAttribute("aria-label", playBtn.title);
+      playBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        toggleSectionPreview(song, i);
+      });
+      wrap.appendChild(nameEl);
+      wrap.appendChild(playBtn);
+      region.appendChild(wrap);
+
+      const localHead = document.createElement("div");
+      localHead.className = "wave-section-playhead";
+      localHead.hidden = !(isActive && (isPlaying || savedProgress > 0.01));
+      if (isActive) {
+        const secDur = Math.max(0.05, end - start);
+        const ratio = Math.max(0, Math.min(1, savedProgress / secDur));
+        localHead.style.left = `${ratio * 100}%`;
+      }
+      region.appendChild(localHead);
+      host.appendChild(region);
+    });
+
+    // Shared boundaries between adjacent sections.
+    for (let i = 1; i < sections.length; i += 1) {
+      const boundary = Number(sections[i].start_sec) || 0;
+      host.appendChild(
+        makeWaveHandle(song, (boundary / dur) * width, () =>
+          beginBoundaryDrag(song, i - 1, i)
+        )
+      );
+    }
+
+    // Start of first section + end of last section.
+    if (sections.length) {
+      const firstStart = Number(sections[0].start_sec) || 0;
+      const lastEnd =
+        Number(sections[sections.length - 1].end_sec) || dur;
+      host.appendChild(
+        makeWaveHandle(song, (firstStart / dur) * width, () =>
+          beginEdgeDrag(song, "start")
+        )
+      );
+      host.appendChild(
+        makeWaveHandle(song, (lastEnd / dur) * width, () =>
+          beginEdgeDrag(song, "end")
+        )
+      );
+    }
+  }
+
+  function makeWaveHandle(song, leftPx, onDown) {
+    const handle = document.createElement("div");
+    handle.className = "wave-handle";
+    handle.style.left = `${leftPx}px`;
+    handle.title = "Drag to resize sections";
+    handle.setAttribute("role", "slider");
+    handle.setAttribute("aria-label", "Section boundary");
+    handle.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      onDown();
+    });
+    void song;
+    return handle;
+  }
+
+  function wireWaveformScrollSync() {
+    const a = document.getElementById("wave-scroll-a");
+    const b = document.getElementById("wave-scroll-b");
+    if (!a || !b || a.dataset.syncBound === "1") return;
+    a.dataset.syncBound = "1";
+    b.dataset.syncBound = "1";
+    let locking = false;
+    const sync = (from, to) => {
+      from.addEventListener("scroll", () => {
+        if (locking) return;
+        locking = true;
+        to.scrollLeft = from.scrollLeft;
+        locking = false;
+      });
+    };
+    sync(a, b);
+    sync(b, a);
+  }
+
+  function ensurePending(song) {
+    if (song === "a") {
+      if (!pendingSections.a) {
+        pendingSections.a = cloneSections(studioState.sections_a);
+      }
+      return pendingSections.a;
+    }
+    if (!pendingSections.b) {
+      pendingSections.b = cloneSections(studioState.sections_b);
+    }
+    return pendingSections.b;
+  }
+
+  function beginBoundaryDrag(song, leftIdx, rightIdx) {
+    const sections = ensurePending(song);
+    const dur = songDuration(song) || 1;
+    const width = Math.max(400, Math.round(dur * PX_PER_SEC));
+    const left = sections[leftIdx];
+    const right = sections[rightIdx];
+    const minT = (Number(left.start_sec) || 0) + MIN_SECTION_SEC;
+    const maxT = (Number(right.end_sec) || dur) - MIN_SECTION_SEC;
+    const onMove = (event) => {
+      const track = document.getElementById(`wave-track-${song}`);
+      if (!track) return;
+      const rect = track.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      let t = (x / width) * dur;
+      t = Math.max(minT, Math.min(maxT, t));
+      left.end_sec = t;
+      right.start_sec = t;
+      renderWaveRegions(song);
+      updateCommitButton();
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+
+  function beginEdgeDrag(song, which) {
+    const sections = ensurePending(song);
+    if (!sections.length) return;
+    const dur = songDuration(song) || 1;
+    const width = Math.max(400, Math.round(dur * PX_PER_SEC));
+    const onMove = (event) => {
+      const track = document.getElementById(`wave-track-${song}`);
+      if (!track) return;
+      const rect = track.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      let t = (x / width) * dur;
+      t = Math.max(0, Math.min(dur, t));
+      if (which === "start") {
+        const first = sections[0];
+        const maxStart =
+          (Number(first.end_sec) || dur) - MIN_SECTION_SEC;
+        first.start_sec = Math.max(0, Math.min(maxStart, t));
+      } else {
+        const last = sections[sections.length - 1];
+        const minEnd =
+          (Number(last.start_sec) || 0) + MIN_SECTION_SEC;
+        last.end_sec = Math.max(minEnd, Math.min(dur, t));
+      }
+      renderWaveRegions(song);
+      updateCommitButton();
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+
+  function updateSectionPlayUi() {
+    document.querySelectorAll(".wave-region").forEach((region) => {
+      const song = region.dataset.song;
+      const index = Number(region.dataset.index);
+      const playBtn = region.querySelector(".wave-play");
+      const head = region.querySelector(".wave-section-playhead");
+      const isActive =
+        activeSectionPreview &&
+        activeSectionPreview.song === song &&
+        activeSectionPreview.index === index;
+      const isPlaying = isActive && !sectionPreviewAudio.paused;
+      region.classList.toggle("is-active", Boolean(isActive));
+      if (playBtn) {
+        playBtn.textContent = isPlaying ? "❚❚" : "▶";
+        playBtn.title = isPlaying ? "Pause section" : "Play section";
+      }
+      if (!head) return;
+      if (!isActive) {
+        head.hidden = true;
+        return;
+      }
+      const start = activeSectionPreview.start;
+      const end = activeSectionPreview.end;
+      const secDur = Math.max(0.05, end - start);
+      const t = sectionPreviewAudio.currentTime || 0;
+      const ratio = Math.max(0, Math.min(1, t / secDur));
+      head.hidden = false;
+      head.style.left = `${ratio * 100}%`;
+    });
+  }
+
+  async function toggleSectionPreview(song, index) {
+    if (!sessionId) return;
+    const sections = sectionsForSong(song);
+    const sec = sections[index];
+    if (!sec) return;
+    const start = Number(sec.start_sec) || 0;
+    const end = Number(sec.end_sec) || start + 1;
+
+    const same =
+      activeSectionPreview &&
+      activeSectionPreview.song === song &&
+      activeSectionPreview.index === index &&
+      Math.abs(activeSectionPreview.start - start) < 0.001 &&
+      Math.abs(activeSectionPreview.end - end) < 0.001;
+
+    if (same && sectionPreviewAudio.src) {
+      if (!sectionPreviewAudio.paused) {
+        sectionPreviewAudio.pause();
+        updateSectionPlayUi();
+        return;
+      }
+      try {
+        await sectionPreviewAudio.play();
+        updateSectionPlayUi();
+      } catch (err) {
+        showError(err instanceof Error ? err.message : "Section play failed.");
+      }
+      return;
+    }
+
+    try {
+      const response = await fetch(
+        `/api/mashup/sessions/${sessionId}/song/${song}/section-preview?start=${start}&end=${end}`
+      );
+      if (!response.ok) throw new Error("Section preview failed");
+      const blob = await response.blob();
+      if (sectionPreviewUrl) URL.revokeObjectURL(sectionPreviewUrl);
+      sectionPreviewUrl = URL.createObjectURL(blob);
+      activeSectionPreview = { song, index, start, end };
+      sectionPreviewAudio.src = sectionPreviewUrl;
+      sectionPreviewAudio.load();
+      await sectionPreviewAudio.play();
+      updateSectionPlayUi();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : "Section preview failed.");
+    }
+  }
+
+  async function decodePeaks(url) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("Failed to load song audio");
+    const buffer = await response.arrayBuffer();
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const audioBuffer = await ctx.decodeAudioData(buffer.slice(0));
+    const channel = audioBuffer.getChannelData(0);
+    const buckets = Math.min(4000, Math.max(200, Math.floor(audioBuffer.duration * PX_PER_SEC)));
+    const peaks = new Float32Array(buckets);
+    const block = Math.floor(channel.length / buckets) || 1;
+    for (let i = 0; i < buckets; i += 1) {
+      let max = 0;
+      const start = i * block;
+      for (let j = 0; j < block && start + j < channel.length; j += 1) {
+        const v = Math.abs(channel[start + j]);
+        if (v > max) max = v;
+      }
+      peaks[i] = max;
+    }
+    try {
+      ctx.close();
+    } catch {
+      /* ignore */
+    }
+    return { peaks, duration: audioBuffer.duration };
+  }
+
+  async function loadWaveforms() {
+    if (!sessionId || !studioWaveforms) return;
+    studioWaveforms.hidden = false;
+    const titleA = document.getElementById("wave-title-a");
+    const titleB = document.getElementById("wave-title-b");
+    if (titleA) titleA.textContent = studioState.title_a || "Song A";
+    if (titleB) titleB.textContent = studioState.title_b || "Song B";
+    try {
+      const [a, b] = await Promise.all([
+        decodePeaks(`/api/mashup/sessions/${sessionId}/song/a/audio`),
+        decodePeaks(`/api/mashup/sessions/${sessionId}/song/b/audio`),
+      ]);
+      wavePeaks.a = a.peaks;
+      wavePeaks.aDur = a.duration;
+      wavePeaks.b = b.peaks;
+      wavePeaks.bDur = b.duration;
+      drawWaveform("a");
+      drawWaveform("b");
+      renderWaveRegions("a");
+      renderWaveRegions("b");
+      wireWaveformScrollSync();
+    } catch (err) {
+      console.warn(err);
+      // Still show regions without peaks.
+      wavePeaks.aDur = Math.max(
+        ...(studioState.sections_a || []).map((s) => Number(s.end_sec) || 0),
+        1
+      );
+      wavePeaks.bDur = Math.max(
+        ...(studioState.sections_b || []).map((s) => Number(s.end_sec) || 0),
+        1
+      );
+      renderWaveRegions("a");
+      renderWaveRegions("b");
+      wireWaveformScrollSync();
+    }
+  }
+
+  async function commitPendingSections() {
+    if (!sessionId || !studioState) return;
+    if (pendingSections.a === null && pendingSections.b === null) return;
+    if (studioAudio.src && Number.isFinite(studioAudio.currentTime)) {
+      playheadTimeSec = studioAudio.currentTime;
+    }
+    const resumeAfter = Boolean(studioAudio.src && !studioAudio.paused);
+    studioAudio.pause();
+    setPlayIcons(false);
+    setPlayheadVisual(playheadTimeSec);
+    try {
+      const response = await fetch(
+        `/api/mashup/sessions/${sessionId}/studio/commit-sections`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sections_a: pendingSections.a,
+            sections_b: pendingSections.b,
+          }),
+        }
+      );
+      if (!response.ok) throw new Error("Commit sections failed");
+      studioState = await response.json();
+      pendingSections = { a: null, b: null };
+      updateCommitButton();
+      renderStudioGrid();
+      renderWaveRegions("a");
+      renderWaveRegions("b");
+      markStudioDirty();
+      const token = ++studioRerenderToken;
+      setRenderingUi(true);
+      studioBusy = true;
+      try {
+        await ensureStudioPreviewLoaded();
+        if (token !== studioRerenderToken) return;
+        const max = studioAudio.duration || 0;
+        const seekTo = Math.max(0, Math.min(playheadTimeSec, max || playheadTimeSec));
+        studioAudio.currentTime = seekTo;
+        playheadTimeSec = seekTo;
+        setPlayheadVisual(playheadTimeSec);
+        if (resumeAfter) {
+          await studioAudio.play();
+          setPlayIcons(true);
+        }
+      } finally {
+        if (token === studioRerenderToken) {
+          setRenderingUi(false);
+          studioBusy = false;
+        }
+      }
+    } catch (err) {
+      showError(err instanceof Error ? err.message : "Commit failed.");
+      setRenderingUi(false);
+      studioBusy = false;
+    }
   }
 
   async function loadStudioState() {
@@ -368,7 +1061,13 @@
     const response = await fetch(`/api/mashup/sessions/${sessionId}/studio`);
     if (!response.ok) throw new Error("Failed to load section editor");
     studioState = await response.json();
+    pendingSections = { a: null, b: null };
+    studioDirty = true;
+    studioAudioReady = false;
+    playheadTimeSec = 0;
+    updateCommitButton();
     renderStudioGrid();
+    await loadWaveforms();
   }
 
   function updateArrangementHint(meta) {
@@ -402,67 +1101,92 @@
     await loadStudioState();
   }
 
-  async function playStudioEdit() {
-    if (!sessionId || !studioPlay) return;
-    studioPlay.disabled = true;
-    studioPlay.textContent = "Rendering…";
+  async function ensureStudioPreviewLoaded() {
+    if (!sessionId) return;
+    if (!studioDirty && studioAudioReady && studioAudio.src) return;
+    if (studioPlay && !studioPlay.classList.contains("rendering")) {
+      setRenderingUi(true);
+    }
+    await persistStudio();
+    const response = await fetch(
+      `/api/mashup/sessions/${sessionId}/studio/preview`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }
+    );
+    if (!response.ok) {
+      let detail = `Preview failed (${response.status})`;
+      try {
+        const payload = await response.json();
+        if (payload && payload.detail) detail = String(payload.detail);
+      } catch {
+        /* ignore */
+      }
+      throw new Error(detail);
+    }
+    const blob = await response.blob();
+    if (studioObjectUrl) URL.revokeObjectURL(studioObjectUrl);
+    studioObjectUrl = URL.createObjectURL(blob);
+    studioAudio.src = studioObjectUrl;
+    studioAudio.load();
+    await new Promise((resolve, reject) => {
+      const onReady = () => {
+        studioAudio.removeEventListener("loadedmetadata", onReady);
+        studioAudio.removeEventListener("error", onErr);
+        resolve();
+      };
+      const onErr = () => {
+        studioAudio.removeEventListener("loadedmetadata", onReady);
+        studioAudio.removeEventListener("error", onErr);
+        reject(new Error("Failed to load preview audio"));
+      };
+      studioAudio.addEventListener("loadedmetadata", onReady);
+      studioAudio.addEventListener("error", onErr);
+    });
+    studioDirty = false;
+    studioAudioReady = true;
+    if (studioDownload) {
+      studioDownload.hidden = false;
+      studioDownload.href = studioObjectUrl;
+    }
+  }
+
+  async function playStudioFromPlayhead({ forceStart = false } = {}) {
+    if (!sessionId || !studioPlay || studioBusy) return;
+    if (!studioAudio.paused && studioAudio.src && !forceStart && !studioDirty) {
+      playheadTimeSec = studioAudio.currentTime;
+      studioAudio.pause();
+      setPlayIcons(false);
+      return;
+    }
+    studioBusy = true;
+    setRenderingUi(studioDirty || !studioAudioReady);
     try {
-      await persistStudio();
-      const response = await fetch(
-        `/api/mashup/sessions/${sessionId}/studio/preview`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        }
-      );
-      if (!response.ok) {
-        let detail = `Preview failed (${response.status})`;
-        try {
-          const payload = await response.json();
-          if (payload && payload.detail) detail = String(payload.detail);
-        } catch {
-          /* ignore */
-        }
-        throw new Error(detail);
-      }
-      const blob = await response.blob();
-      if (studioObjectUrl) URL.revokeObjectURL(studioObjectUrl);
-      studioObjectUrl = URL.createObjectURL(blob);
-      studioAudio.src = studioObjectUrl;
-      studioAudio.load();
+      const seekTo = forceStart ? 0 : playheadTimeSec;
+      if (forceStart) playheadTimeSec = 0;
+      await ensureStudioPreviewLoaded();
+      const max = studioAudio.duration || 0;
+      studioAudio.currentTime = Math.max(0, Math.min(seekTo, max || seekTo));
+      playheadTimeSec = studioAudio.currentTime;
+      setPlayheadVisual(playheadTimeSec);
       await studioAudio.play();
-      studioPlay.textContent = "Pause edit";
-      if (studioDownload) {
-        studioDownload.hidden = false;
-        studioDownload.href = studioObjectUrl;
-      }
+      setPlayIcons(true);
       if (studioPlayhead) studioPlayhead.hidden = false;
     } catch (err) {
       showError(err instanceof Error ? err.message : "Studio preview failed.");
-      studioPlay.textContent = "Play edit";
+      setPlayIcons(false);
     } finally {
-      studioPlay.disabled = false;
+      setRenderingUi(false);
+      studioBusy = false;
     }
   }
 
   function updateStudioPlayhead() {
-    if (!studioPlayhead || !studioState || !studioAudio.duration) return;
-    const widths = columnWidths();
-    const totalMs = studioState.columns.reduce(
-      (sum, col) => sum + (Number(col.duration_ms) || 0),
-      0
-    );
-    const t = studioAudio.currentTime;
-    const ratio = totalMs > 0 ? (t * 1000) / totalMs : t / studioAudio.duration;
-    const x = 120 + ratio * widths.reduce((a, b) => a + b, 0);
-    studioPlayhead.style.transform = `translateX(${x}px)`;
-    studioPlayhead.hidden = false;
-    if (studioTime) {
-      studioTime.textContent = `${formatTime(t)} / ${formatTime(
-        studioAudio.duration || 0
-      )}`;
-    }
+    if (!studioState) return;
+    playheadTimeSec = studioAudio.currentTime || playheadTimeSec;
+    setPlayheadVisual(playheadTimeSec);
   }
 
   async function runMashup() {
@@ -570,19 +1294,34 @@
   });
 
   if (studioPlay) {
-    studioPlay.addEventListener("click", async () => {
-      if (!studioAudio.paused && studioAudio.src) {
-        studioAudio.pause();
-        studioPlay.textContent = "Play edit";
-        return;
-      }
-      await playStudioEdit();
-    });
+    studioPlay.addEventListener("click", () => playStudioFromPlayhead());
+  }
+  if (studioSkip) {
+    studioSkip.addEventListener("click", () =>
+      playStudioFromPlayhead({ forceStart: true })
+    );
+  }
+  if (commitSectionsBtn) {
+    commitSectionsBtn.addEventListener("click", commitPendingSections);
   }
   studioAudio.addEventListener("timeupdate", updateStudioPlayhead);
   studioAudio.addEventListener("ended", () => {
-    if (studioPlay) studioPlay.textContent = "Play edit";
+    setPlayIcons(false);
+    playheadTimeSec = studioAudio.duration || playheadTimeSec;
   });
+  studioAudio.addEventListener("pause", () => setPlayIcons(false));
+  studioAudio.addEventListener("play", () => setPlayIcons(true));
+
+  if (sectionPreviewAudio) {
+    sectionPreviewAudio.addEventListener("timeupdate", updateSectionPlayUi);
+    sectionPreviewAudio.addEventListener("play", updateSectionPlayUi);
+    sectionPreviewAudio.addEventListener("pause", updateSectionPlayUi);
+    sectionPreviewAudio.addEventListener("ended", () => {
+      if (sectionPreviewAudio) sectionPreviewAudio.currentTime = 0;
+      updateSectionPlayUi();
+    });
+  }
+
   if (studioDownload) {
     studioDownload.addEventListener("click", async (event) => {
       if (!sessionId) return;
@@ -592,6 +1331,9 @@
       }
       event.preventDefault();
       try {
+        if (studioDirty || !studioObjectUrl) {
+          await ensureStudioPreviewLoaded();
+        }
         await persistStudio();
         const response = await fetch(
           `/api/mashup/sessions/${sessionId}/studio/render`,

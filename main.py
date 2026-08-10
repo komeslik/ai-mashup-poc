@@ -36,7 +36,14 @@ from services.dual_mix import (
 )
 from services.form_analysis import resolve_sections_dsp, resolve_sections_llm
 from services.mashability import MashabilityWeights
-from services.studio_mix import load_studio, render_studio, save_studio
+from services.studio_mix import (
+    apply_committed_sections,
+    ensure_song_preview,
+    extract_song_range,
+    load_studio,
+    render_studio,
+    save_studio,
+)
 
 load_dotenv()
 
@@ -82,6 +89,11 @@ class StudioPutBody(BaseModel):
 
 class StudioPreviewBody(BaseModel):
     column_id: str | None = None
+
+
+class CommitSectionsBody(BaseModel):
+    sections_a: list[dict[str, Any]] | None = None
+    sections_b: list[dict[str, Any]] | None = None
 
 
 def _suffix_for_upload(upload: UploadFile, default: str = ".mp3") -> str:
@@ -198,6 +210,64 @@ def put_studio(session_id: str, body: StudioPutBody) -> JSONResponse:
         raise HTTPException(status_code=400, detail="studio.columns required")
     save_studio(session, body.studio)
     return JSONResponse({"ok": True})
+
+
+@app.post("/api/mashup/sessions/{session_id}/studio/commit-sections")
+def commit_sections(session_id: str, body: CommitSectionsBody) -> JSONResponse:
+    session = _session_dir(session_id)
+    try:
+        studio = load_studio(session)
+        studio = apply_committed_sections(
+            studio,
+            sections_a=body.sections_a,
+            sections_b=body.sections_b,
+        )
+        save_studio(session, studio)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(studio)
+
+
+@app.get("/api/mashup/sessions/{session_id}/song/{song}/audio")
+async def get_song_audio(
+    session_id: str,
+    song: Literal["a", "b"],
+) -> FileResponse:
+    session = _session_dir(session_id)
+    try:
+        path = await asyncio.to_thread(ensure_song_preview, session, song)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        path=str(path),
+        media_type="audio/mpeg",
+        filename=f"song_{song}_preview.mp3",
+    )
+
+
+@app.get("/api/mashup/sessions/{session_id}/song/{song}/section-preview")
+async def get_song_section_preview(
+    session_id: str,
+    song: Literal["a", "b"],
+    start: float = 0.0,
+    end: float = 1.0,
+) -> FileResponse:
+    session = _session_dir(session_id)
+    out_dir = tempfile.mkdtemp(prefix="sec_prev_", dir="/tmp")
+    out_path = Path(out_dir) / "section.mp3"
+    try:
+        await asyncio.to_thread(
+            extract_song_range, session, song, start, end, out_path
+        )
+    except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(
+        path=str(out_path),
+        media_type="audio/mpeg",
+        filename=f"song_{song}_section.mp3",
+        background=BackgroundTask(shutil.rmtree, out_dir, ignore_errors=True),
+    )
 
 
 @app.get("/api/mashup/sessions/{session_id}/clips/{song}/{stem}")
