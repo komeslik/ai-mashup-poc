@@ -156,6 +156,14 @@
     if (!sectionEditor || !phraseList || !meta || !Array.isArray(meta.phrases)) {
       return;
     }
+    const directorHint = document.getElementById("director-mode-hint");
+    if (directorHint) {
+      const strict = meta.director_strict !== false;
+      directorHint.hidden = false;
+      directorHint.textContent = strict
+        ? "AI Director · strict (one vocal at a time)"
+        : "AI Director · muted harmony allowed (overlap hard-muted)";
+    }
     const arrangementHint = document.getElementById("arrangement-hint");
     if (arrangementHint) {
       if (meta.arranging_reasoning) {
@@ -166,24 +174,41 @@
         arrangementHint.textContent = "";
       }
     }
+    const stemHint = document.getElementById("stem-actions-hint");
+    if (stemHint) {
+      const actions = Array.isArray(meta.stem_actions) ? meta.stem_actions : [];
+      if (actions.length) {
+        stemHint.hidden = false;
+        stemHint.textContent = actions
+          .map((a) => {
+            const bars = `${a.bar_start}–${a.bar_end}`;
+            const vox = a.vocal_source === "none" ? "instr" : a.vocal_source;
+            return `bars ${bars}: ${vox}`;
+          })
+          .join(" · ");
+      } else {
+        stemHint.hidden = true;
+        stemHint.textContent = "";
+      }
+    }
     phraseList.innerHTML = "";
     meta.phrases.forEach((phrase) => {
       const li = document.createElement("li");
       li.className = "phrase-item";
       const checked = phrase.enabled !== false ? "checked" : "";
-      const title =
-        phrase.section_name ||
-        `S${phrase.index}${phrase.label ? ` · ${phrase.label}` : ""}`;
+      const title = phrase.section_name || `S${phrase.index}`;
+      const role = phrase.label ? ` · ${phrase.label}` : "";
       li.innerHTML = `
         <label>
           <input type="checkbox" data-phrase-index="${phrase.index}" ${checked} />
-          <span class="phrase-main">${title} · ${phrase.lead}</span>
+          <span class="phrase-main">${title}${role} · ${phrase.lead}</span>
           <span class="phrase-meta">
             score ${Number(phrase.mashability_score || 0).toFixed(2)}
             · rhythm ${Number(phrase.rhythmic_score || 0).toFixed(2)}
             · ${phrase.n_steps >= 0 ? "+" : ""}${phrase.n_steps}st
-            ${phrase.harmony ? "· harmony" : ""}
-            ${phrase.vad_ducked_frames ? `· VAD duck ${phrase.vad_ducked_frames}` : ""}
+            ${phrase.harmony ? "· muted harmony" : ""}
+            ${phrase.vad_muted_frames ? `· VAD mute ${phrase.vad_muted_frames}` : ""}
+            ${phrase.instr_ducked_frames ? `· instr duck ${phrase.instr_ducked_frames}` : ""}
           </span>
         </label>
       `;

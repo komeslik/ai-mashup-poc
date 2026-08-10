@@ -12,6 +12,7 @@ from pydub import AudioSegment
 
 from services.agent import ArrangementSegment, MashupBlueprint
 from services.audio import (
+    crossfade_concatenate,
     extract_audio_segment,
     fit_length,
     get_key,
@@ -27,8 +28,8 @@ from services.mashability import (
     MashabilityWeights,
     find_best_mashability_alignment,
 )
-from services.structure import Section, detect_sections, pick_section
-from services.vad import apply_overlap_duck
+from services.structure import Section, detect_sections, is_high_energy_label, pick_section
+from services.vad import apply_overlap_mute, duck_instrumental_under_vocals
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,9 @@ CreativeMode = Literal["forced_match", "style_contrast", "bassline"]
 
 HARMONY_GAIN_DB = -7.0
 STRETCH_EPSILON = 0.01
-VOCAL_HPF_HZ = 100.0
+VOCAL_HPF_HZ = 120.0
+INSTR_DUCK_DB = -2.5
+CROSSFADE_MS = 600
 DEFAULT_BARS_PER_SECTION = 8
 DEFAULT_MAX_SECTIONS = 8
 
@@ -59,12 +62,16 @@ class PhraseScheduleEntry:
     harmony_suppressed_low_rhythm: bool
     vad_overlap_frames: int
     vad_ducked_frames: int
+    vad_muted_frames: int = 0
+    instr_ducked_frames: int = 0
     enabled: bool = True
     phrase_file: str | None = None
     section_name: str | None = None
     vocal_section_index: int | None = None
     instrumental_section_index: int | None = None
     label: str | None = None
+    high_pass_filter: bool = True
+    vocal_volume_db: float = 0.0
 
 
 @dataclass
@@ -105,6 +112,10 @@ def _scale_sections_after_stretch(
             label=s.label,
             energy=s.energy,
             bars=s.bars,
+            spectral_centroid=s.spectral_centroid,
+            vocal_density=s.vocal_density,
+            bar_start=s.bar_start,
+            bar_end=s.bar_end,
         )
         for s in sections
     ]
@@ -358,15 +369,15 @@ def build_dual_vocal_mashup(
         target_ms = len(instrumental_seg)
 
         lead = _lead_letter(segment.vocal_source)
-        harmony = bool(segment.harmony) or (
-            lead is not None and _allows_harmony(policy)
-        )
+        # Director-strict: harmony only when UI/policy explicitly allows it.
+        harmony = bool(segment.harmony) and _allows_harmony(policy)
+        if not _allows_harmony(policy):
+            harmony = False
 
         canvas = AudioSegment.silent(
             duration=target_ms,
             frame_rate=instrumental_seg.frame_rate,
         ).set_channels(instrumental_seg.channels)
-        phrase_mix = canvas.overlay(instrumental_seg)
 
         scores: dict[str, float | int | bool] = {
             "mashability_score": 0.0,
@@ -378,6 +389,9 @@ def build_dual_vocal_mashup(
         }
         lead_seg: AudioSegment | None = None
         vocal_section_used: Section | None = None
+        apply_hpf = bool(getattr(segment, "high_pass_filter", True))
+        vocal_gain = float(getattr(segment, "vocal_volume_db", 0.0) or 0.0)
+        instr_ducked_frames = 0
 
         if lead is not None:
             if lead == "a":
@@ -402,17 +416,36 @@ def build_dual_vocal_mashup(
             )
             lead_seg = fit_length(lead_seg, target_ms)
             lead_seg = _match_format(lead_seg, instrumental_seg)
-            try:
-                lead_seg = highpass_segment(lead_seg, cutoff_hz=VOCAL_HPF_HZ)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Lead HPF failed: %s", exc)
+            if apply_hpf:
+                try:
+                    lead_seg = highpass_segment(lead_seg, cutoff_hz=VOCAL_HPF_HZ)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Lead HPF failed: %s", exc)
             lead_seg = match_loudness(lead_seg, instrumental_seg)
+            if abs(vocal_gain) > 0.01:
+                lead_seg = lead_seg.apply_gain(vocal_gain)
+
+            # Sidechain-style instrumental duck under active vocals.
+            try:
+                ducked = duck_instrumental_under_vocals(
+                    instrumental_seg,
+                    lead_seg,
+                    duck_db=INSTR_DUCK_DB,
+                )
+                instrumental_seg = ducked.segment
+                instr_ducked_frames = ducked.ducked_frames
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Instrumental duck failed: %s", exc)
+
+        phrase_mix = canvas.overlay(instrumental_seg)
+        if lead_seg is not None:
             phrase_mix = phrase_mix.overlay(lead_seg)
 
         harmony_applied = False
         harmony_suppressed = False
         vad_overlap = 0
         vad_ducked = 0
+        vad_muted = 0
 
         if lead is not None and harmony and lead_seg is not None:
             if float(scores["rhythmic_score"]) < LOW_RHYTHM_THRESHOLD:
@@ -430,9 +463,9 @@ def build_dual_vocal_mashup(
                         if segment.vocal_section_index < len(other_map)
                         else 0,
                     )
-                    # Prefer a high other-vocal section for harmony color.
                     high_other = next(
-                        (s for s in other_map if s.label == "high"), other_section
+                        (s for s in other_map if is_high_energy_label(s.label)),
+                        other_section,
                     )
                     harmony_seg, _ = _prepare_contiguous_lead(
                         other_path,
@@ -444,21 +477,24 @@ def build_dual_vocal_mashup(
                     )
                     harmony_seg = fit_length(harmony_seg, target_ms)
                     harmony_seg = _match_format(harmony_seg, instrumental_seg)
-                    try:
-                        harmony_seg = highpass_segment(
-                            harmony_seg, cutoff_hz=VOCAL_HPF_HZ
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("Harmony HPF failed: %s", exc)
+                    if apply_hpf:
+                        try:
+                            harmony_seg = highpass_segment(
+                                harmony_seg, cutoff_hz=VOCAL_HPF_HZ
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Harmony HPF failed: %s", exc)
                     harmony_seg = match_loudness(
                         harmony_seg,
                         instrumental_seg,
                         target_offset_db=HARMONY_GAIN_DB,
                     )
-                    vad = apply_overlap_duck(lead_seg, harmony_seg, duck_db=-18.0)
+                    # Hard mute on overlap — never leave two active leads.
+                    vad = apply_overlap_mute(lead_seg, harmony_seg)
                     harmony_seg = vad.segment
                     vad_overlap = vad.overlap_frames
                     vad_ducked = vad.ducked_frames
+                    vad_muted = vad.muted_frames
                     phrase_mix = phrase_mix.overlay(harmony_seg)
                     harmony_applied = True
                 except Exception as exc:  # noqa: BLE001
@@ -485,27 +521,33 @@ def build_dual_vocal_mashup(
             harmony_suppressed_low_rhythm=harmony_suppressed,
             vad_overlap_frames=vad_overlap,
             vad_ducked_frames=vad_ducked,
+            vad_muted_frames=vad_muted,
+            instr_ducked_frames=instr_ducked_frames,
             enabled=True,
             phrase_file=str(phrase_file.name),
             section_name=segment.section_name,
             vocal_section_index=segment.vocal_section_index,
             instrumental_section_index=segment.instrumental_section_index,
             label=instr_section.label,
+            high_pass_filter=apply_hpf,
+            vocal_volume_db=vocal_gain,
         )
         schedule.append(entry)
         logger.info(
-            "Segment %d — %s lead=%s score=%.3f duration_ms=%d",
+            "Segment %d — %s lead=%s score=%.3f duration_ms=%d muted=%d instr_duck=%d",
             index,
             segment.section_name,
             entry.lead,
             entry.mashability_score,
             target_ms,
+            vad_muted,
+            instr_ducked_frames,
         )
 
     if not mixed_phrases:
         raise RuntimeError("No sections were produced for dual-vocal mashup")
 
-    combined = sum(mixed_phrases[1:], mixed_phrases[0])
+    combined = crossfade_concatenate(mixed_phrases, crossfade_ms=CROSSFADE_MS)
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     combined.export(str(out), format="mp3")
@@ -516,6 +558,9 @@ def build_dual_vocal_mashup(
         "first_lead": first_lead,
         "target_bpm": target_bpm,
         "bars_per_section": bars_per_section,
+        "director_strict": not _allows_harmony(policy),
+        "crossfade_ms": CROSSFADE_MS,
+        "instr_duck_db": INSTR_DUCK_DB,
         "phrases": [asdict(p) for p in schedule],
         "sections_a": [s.to_prompt_dict() for s in sections_a],
         "sections_b": [s.to_prompt_dict() for s in sections_b],
@@ -523,6 +568,8 @@ def build_dual_vocal_mashup(
     if blueprint is not None:
         metadata["blueprint"] = blueprint.model_dump()
         metadata["arranging_reasoning"] = blueprint.arranging_reasoning
+        if blueprint.actions:
+            metadata["stem_actions"] = [a.model_dump() for a in blueprint.actions]
 
     meta_path = session_dir / "metadata.json"
     meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -634,7 +681,7 @@ def reassemble_session(
     if not segments:
         raise RuntimeError("No phrases enabled for reassembly")
 
-    combined = sum(segments[1:], segments[0])
+    combined = crossfade_concatenate(segments, crossfade_ms=CROSSFADE_MS)
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     combined.export(str(out), format="mp3")

@@ -59,6 +59,11 @@ VocalPolicyForm = Literal[
 ]
 
 
+def _allow_harmony(vocal_policy: VocalPolicyForm, _policy: PhraseVocalPolicy | None = None) -> bool:
+    """Director-strict by default; muted harmony only when UI picks a harmony policy."""
+    return vocal_policy in ("a_lead_b_harmony", "b_lead_a_harmony")
+
+
 class ReassembleBody(BaseModel):
     enabled_indices: list[int] = Field(default_factory=list)
 
@@ -179,7 +184,7 @@ async def reassemble(session_id: str, body: ReassembleBody) -> FileResponse:
 async def create_mashup(
     song_a: UploadFile = File(..., description="First song audio file"),
     song_b: UploadFile = File(..., description="Second song audio file"),
-    vocal_policy: VocalPolicyForm = Form("auto"),
+    vocal_policy: VocalPolicyForm = Form("alternate"),
     creative_mode: CreativeMode = Form("forced_match"),
     harmonic_weight: float = Form(0.6),
     rhythmic_weight: float = Form(0.25),
@@ -244,18 +249,38 @@ async def create_mashup(
                     sections_a = None
                     sections_b = None
                     logger.info("Mashup decision: %s", decision.model_dump())
+                    first_lead = "a" if decision.vocal_source == "song_a" else "b"
+                    policy = _resolve_policy(vocal_policy, decision)
                 else:
+                    logger.info("Two-stem Demucs for vocal mashup")
+                    stems_a = await asyncio.to_thread(
+                        separate_stems, str(song_a_path), str(stems_a_dir)
+                    )
+                    stems_b = await asyncio.to_thread(
+                        separate_stems, str(song_b_path), str(stems_b_dir)
+                    )
+                    vocals_a, instr_a = stems_a
+                    vocals_b, instr_b = stems_b
+
+                    # Role maps after Demucs so vocal_density uses vocal stems.
                     sections_a = await asyncio.to_thread(
-                        detect_sections, str(song_a_path)
+                        detect_sections,
+                        str(song_a_path),
+                        vocals_path=vocals_a,
                     )
                     sections_b = await asyncio.to_thread(
-                        detect_sections, str(song_b_path)
+                        detect_sections,
+                        str(song_b_path),
+                        vocals_path=vocals_b,
                     )
                     logger.info(
                         "Sections — A: %d, B: %d",
                         len(sections_a),
                         len(sections_b),
                     )
+
+                    allow_harmony = _allow_harmony(vocal_policy)
+
                     blueprint = decide_arrangement(
                         bpm_a,
                         bpm_b,
@@ -264,21 +289,25 @@ async def create_mashup(
                         creative_mode=creative_mode,
                         title_a=title_a,
                         title_b=title_b,
+                        allow_harmony=allow_harmony,
                     )
                     decision = blueprint.as_decision()
+                    first_lead = "a" if decision.vocal_source == "song_a" else "b"
+                    policy = _resolve_policy(vocal_policy, decision)
+                    if not allow_harmony:
+                        policy = "alternate"
                     logger.info(
-                        "Arrangement: %s | timeline=%d",
+                        "Arrangement: %s | timeline=%d | actions=%d | strict=%s",
                         blueprint.arranging_reasoning,
                         len(blueprint.timeline),
+                        len(blueprint.actions),
+                        not allow_harmony,
                     )
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(
                     status_code=502,
                     detail=f"Mashup strategy failed: {exc}",
                 ) from exc
-
-            first_lead = "a" if decision.vocal_source == "song_a" else "b"
-            policy = _resolve_policy(vocal_policy, decision)
 
             try:
                 if creative_mode == "bassline":
@@ -289,7 +318,6 @@ async def create_mashup(
                     full_b = await asyncio.to_thread(
                         separate_full_stems, str(song_b_path), str(stems_b_dir)
                     )
-                    # Bed from instrumental-source song's drums+other.
                     if decision.instrumental_source == "song_a":
                         drums_bed, other_bed = full_a.drums, full_a.other
                     else:
@@ -310,16 +338,9 @@ async def create_mashup(
                         session_dir=session_dir,
                     )
                 else:
-                    logger.info("Two-stem Demucs for vocal mashup")
-                    stems_a = await asyncio.to_thread(
-                        separate_stems, str(song_a_path), str(stems_a_dir)
+                    instrumental_path = (
+                        instr_a if decision.instrumental_source == "song_a" else instr_b
                     )
-                    stems_b = await asyncio.to_thread(
-                        separate_stems, str(song_b_path), str(stems_b_dir)
-                    )
-                    instrumental_path = _instrumental_path(decision, stems_a, stems_b)
-                    vocals_a, _ = stems_a
-                    vocals_b, _ = stems_b
                     result = await asyncio.to_thread(
                         build_dual_vocal_mashup,
                         vocals_a=vocals_a,

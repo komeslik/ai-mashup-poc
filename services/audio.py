@@ -598,6 +598,31 @@ def fit_length(segment: AudioSegment, target_ms: int) -> AudioSegment:
     return combined[:target_ms]
 
 
+def crossfade_concatenate(
+    segments: list[AudioSegment],
+    *,
+    crossfade_ms: int = 500,
+) -> AudioSegment:
+    """
+    Stitch segments with linear crossfades (DJ-style section transitions).
+
+    Falls back to hard abut when a segment is shorter than the crossfade window.
+    """
+    if not segments:
+        raise ValueError("No segments to concatenate")
+    if len(segments) == 1:
+        return segments[0]
+
+    combined = segments[0]
+    for nxt in segments[1:]:
+        fade = min(crossfade_ms, len(combined) // 2, len(nxt) // 2)
+        if fade < 20:
+            combined = combined + nxt
+        else:
+            combined = combined.append(nxt, crossfade=fade)
+    return combined
+
+
 def mix_stems(
     vocal_path: str,
     instrumental_path: str,

@@ -19,7 +19,7 @@
         <p class="brand">MASHUP</p>
         <h1>Drop two tracks. Get one blend.</h1>
         <p class="lede">
-          Phrase-aware dual vocals, mashability scoring, LUFS + VAD mix hygiene.
+          AI Director arrangements, role-mapped sections, one-vocal anti-collision.
         </p>
       </header>
 
@@ -77,10 +77,16 @@
         <label class="control">
           <span class="control-label">Vocal schedule</span>
           <select id="vocal-policy" name="vocal_policy">
-            <option value="auto" selected>Auto (LLM)</option>
-            <option value="alternate">Alternate both singers</option>
-            <option value="a_lead_b_harmony">A lead · B harmony</option>
-            <option value="b_lead_a_harmony">B lead · A harmony</option>
+            <option value="alternate" selected>
+              Director strict (one vocal)
+            </option>
+            <option value="auto">Auto (LLM · still one-vocal)</option>
+            <option value="a_lead_b_harmony">
+              Allow muted harmony · A lead
+            </option>
+            <option value="b_lead_a_harmony">
+              Allow muted harmony · B lead
+            </option>
           </select>
         </label>
       </section>
@@ -111,7 +117,9 @@
         <section class="section-editor" id="section-editor" hidden>
           <h2 class="editor-title">Section editor</h2>
           <p class="editor-hint">Toggle sections, then rebuild the mashup.</p>
+          <p class="editor-hint" id="director-mode-hint" hidden></p>
           <p class="editor-hint" id="arrangement-hint" hidden></p>
+          <p class="editor-hint" id="stem-actions-hint" hidden></p>
           <ul class="phrase-list" id="phrase-list"></ul>
           <button type="button" class="btn-secondary" id="rebuild-btn" hidden>
             Rebuild from selection
