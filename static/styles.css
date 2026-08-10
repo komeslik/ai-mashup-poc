@@ -184,6 +184,45 @@ body {
     background 0.15s ease;
 }
 
+.controls {
+  margin-top: 1.35rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 1.5rem;
+  align-items: end;
+  animation: rise 0.7s ease 0.1s both;
+}
+
+.control {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: min(100%, 16rem);
+}
+
+.control-label {
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.control select {
+  appearance: none;
+  background: rgba(16, 23, 15, 0.55);
+  color: var(--text);
+  border: 1px solid rgba(214, 245, 120, 0.22);
+  border-radius: 0.55rem;
+  padding: 0.7rem 0.9rem;
+  font: inherit;
+  font-size: 0.95rem;
+}
+
+.control select:focus {
+  outline: 2px solid rgba(214, 245, 120, 0.45);
+  outline-offset: 2px;
+}
+
 .btn-primary {
   padding: 0.95rem 1.8rem;
   background: var(--accent);
@@ -203,6 +242,93 @@ body {
 .btn-primary.busy {
   opacity: 0.55;
   cursor: wait;
+}
+
+.btn-secondary {
+  appearance: none;
+  border: 1px solid rgba(214, 245, 120, 0.28);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 0.92rem;
+  font-weight: 600;
+  padding: 0.65rem 1.15rem;
+  cursor: pointer;
+}
+
+.btn-secondary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.section-editor,
+.library-panel {
+  margin-top: 1.5rem;
+  padding-top: 0.25rem;
+}
+
+.editor-title {
+  margin: 0 0 0.35rem;
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+}
+
+.editor-hint {
+  margin: 0 0 0.85rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.phrase-list,
+.library-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.55rem;
+}
+
+.phrase-item,
+.library-item {
+  padding: 0.7rem 0.85rem;
+  border: 1px solid rgba(214, 245, 120, 0.14);
+  border-radius: 0.55rem;
+  background: rgba(16, 23, 15, 0.4);
+  font-size: 0.9rem;
+}
+
+.phrase-item label {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 0.7rem;
+  align-items: start;
+  cursor: pointer;
+}
+
+.phrase-item input {
+  margin-top: 0.2rem;
+}
+
+.phrase-main {
+  font-weight: 600;
+}
+
+.phrase-meta {
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.library-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-bottom: 0.85rem;
+}
+
+#rebuild-btn {
+  margin-top: 0.9rem;
 }
 
 .status-panel {

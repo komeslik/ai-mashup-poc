@@ -1,22 +1,22 @@
 ---
 name: AutoMashUpper Improvements
-overview: "After Gemini/OpenAI (done), upgrade DSP for beat/phrase mashability and dual-vocal mashups so both singers appear via phrase-aware scheduling—not a single global vocal pick."
+overview: After Gemini/OpenAI (done), upgrade DSP for beat/phrase mashability and dual-vocal mashups so both singers appear via phrase-aware scheduling—not a single global vocal pick.
 todos:
   - id: phase0-llm-provider-flag
     content: "Phase 0: LLM_PROVIDER flag (openai|gemini) — DONE"
     status: completed
   - id: phase1-beats-local-chroma
     content: "Phase 1: beat grid, tempo-octave, local chroma match + loudness-normalized mix (still single-vocal path)"
-    status: pending
+    status: completed
   - id: phase2-phrases-dual-vocals
     content: "Phase 2: phrase segmentation on both songs + schedule BOTH vocal stems into the mashup (alternate/call-response; optional short harmony overlays)"
-    status: pending
+    status: completed
   - id: phase3-mashability-ui
     content: "Phase 3: harmonic/rhythmic/spectral mashability weights + UI/API controls for dual-vocal policy"
-    status: pending
+    status: completed
   - id: phase4-optional
-    content: "Phase 4 (later): library search, rubberband/tuning cents, section editor"
-    status: pending
+    content: "Phase 4: library search, rubberband/cents, section editor — DONE (see gap backlog)"
+    status: completed
 isProject: false
 ---
 

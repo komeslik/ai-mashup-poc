@@ -19,7 +19,7 @@
         <p class="brand">MASHUP</p>
         <h1>Drop two tracks. Get one blend.</h1>
         <p class="lede">
-          Stem separation, BPM align, and a mixed MP3 — usually a few minutes.
+          Phrase-aware dual vocals, mashability scoring, LUFS + VAD mix hygiene.
         </p>
       </header>
 
@@ -65,6 +65,26 @@
         </div>
       </section>
 
+      <section class="controls" aria-label="Mashup options">
+        <label class="control">
+          <span class="control-label">Creative mode</span>
+          <select id="creative-mode" name="creative_mode">
+            <option value="forced_match" selected>Forced match</option>
+            <option value="style_contrast">Style contrast</option>
+            <option value="bassline">Bassline / musician</option>
+          </select>
+        </label>
+        <label class="control">
+          <span class="control-label">Vocal schedule</span>
+          <select id="vocal-policy" name="vocal_policy">
+            <option value="auto" selected>Auto (LLM)</option>
+            <option value="alternate">Alternate both singers</option>
+            <option value="a_lead_b_harmony">A lead · B harmony</option>
+            <option value="b_lead_a_harmony">B lead · A harmony</option>
+          </select>
+        </label>
+      </section>
+
       <div class="actions">
         <button type="button" class="btn-primary" id="mashup-btn" disabled>
           Mashup
@@ -87,6 +107,30 @@
         <a class="btn-download" id="download-btn" hidden download="mashup.mp3">
           Download mashup.mp3
         </a>
+
+        <section class="section-editor" id="section-editor" hidden>
+          <h2 class="editor-title">Section editor</h2>
+          <p class="editor-hint">Toggle sections, then rebuild the mashup.</p>
+          <p class="editor-hint" id="arrangement-hint" hidden></p>
+          <ul class="phrase-list" id="phrase-list"></ul>
+          <button type="button" class="btn-secondary" id="rebuild-btn" hidden>
+            Rebuild from selection
+          </button>
+        </section>
+      </section>
+
+      <section class="library-panel" aria-label="Local library">
+        <h2 class="editor-title">Library</h2>
+        <p class="editor-hint">
+          Drop tracks into <code>library/</code> then refresh. Search ranks them vs Song A.
+        </p>
+        <div class="library-actions">
+          <button type="button" class="btn-secondary" id="library-refresh">Refresh</button>
+          <button type="button" class="btn-secondary" id="library-search" disabled>
+            Rank vs Song A
+          </button>
+        </div>
+        <ul class="library-list" id="library-list"></ul>
       </section>
     </main>
 

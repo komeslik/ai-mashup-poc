@@ -41,3 +41,10 @@ mashup.mp3
 tmp/
 temp/
 /tmp/
+
+# Local track library (audio stays on disk; keep the readme)
+library/**
+!library/README.txt
+
+# Local paper reference (do not commit)
+AutoMashUpper_Automatic_Creation_of_Multi-Song_Music_Mashups.pdf
