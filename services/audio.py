@@ -159,6 +159,14 @@ def _pitch_class_from_key(key: str) -> int:
         raise ValueError(f"Unrecognized key label: {key!r}") from exc
 
 
+def wrap_signed_semitones(diff: int) -> int:
+    """Wrap a pitch-class delta into signed ``[-6, +6]``."""
+    d = int(diff) % 12
+    if d > 6:
+        d -= 12
+    return d
+
+
 def semitones_to_match_key(source_key: str, target_key: str) -> int:
     """
     Shortest signed semitone shift so *source_key*'s root matches *target_key*'s root.
@@ -166,10 +174,39 @@ def semitones_to_match_key(source_key: str, target_key: str) -> int:
     Mode (major/minor) is ignored for the shift amount — we align pitch class only,
     which is the usual POC mashup approach.
     """
-    diff = (_pitch_class_from_key(target_key) - _pitch_class_from_key(source_key)) % 12
-    if diff > 6:
-        diff -= 12
-    return int(diff)
+    diff = _pitch_class_from_key(target_key) - _pitch_class_from_key(source_key)
+    return wrap_signed_semitones(diff)
+
+
+def minimal_meeting_shifts(key_a: str, key_b: str) -> tuple[int, int, int]:
+    """
+    Choose a meeting pitch class that minimizes total transposition for both songs.
+
+    Returns ``(shift_a, shift_b, target_pitch_class)`` where each shift is in
+    ``[-6, +6]``. Ties prefer a smaller max(|sa|,|sb|), then prefer ``sa == 0``
+    so the Song A anchor stays unshifted when possible.
+
+    Splitting (e.g. +2 / −2) avoids dumping the whole key gap onto one singer.
+    """
+    pc_a = _pitch_class_from_key(key_a)
+    pc_b = _pitch_class_from_key(key_b)
+
+    best: tuple[int, int, int] | None = None
+    best_key: tuple[int, int, int] | None = None  # (cost, max_abs, prefer_a_shift)
+
+    for target in range(12):
+        sa = wrap_signed_semitones(target - pc_a)
+        sb = wrap_signed_semitones(target - pc_b)
+        cost = abs(sa) + abs(sb)
+        max_abs = max(abs(sa), abs(sb))
+        # prefer_a_shift: 0 if sa==0 else 1 (lower is better)
+        tie = (cost, max_abs, 0 if sa == 0 else 1)
+        if best_key is None or tie < best_key:
+            best_key = tie
+            best = (sa, sb, target)
+
+    assert best is not None
+    return best
 
 
 def _beat_sync_chroma(y: np.ndarray, sr: int, beat_times: np.ndarray) -> np.ndarray:
@@ -616,6 +653,36 @@ def crossfade_concatenate(
     combined = segments[0]
     for nxt in segments[1:]:
         fade = min(crossfade_ms, len(combined) // 2, len(nxt) // 2)
+        if fade < 20:
+            combined = combined + nxt
+        else:
+            combined = combined.append(nxt, crossfade=fade)
+    return combined
+
+
+def crossfade_concatenate_adaptive(
+    segments: list[AudioSegment],
+    fade_ms_list: list[int],
+) -> AudioSegment:
+    """
+    Stitch segments where each join can use a different crossfade duration.
+
+    ``fade_ms_list[i]`` is the fade used when appending ``segments[i + 1]``.
+    Length must be ``len(segments) - 1`` (empty list OK for a single segment).
+    """
+    if not segments:
+        raise ValueError("No segments to concatenate")
+    if len(segments) == 1:
+        return segments[0]
+    if len(fade_ms_list) != len(segments) - 1:
+        raise ValueError(
+            f"fade_ms_list length {len(fade_ms_list)} must be len(segments)-1 "
+            f"({len(segments) - 1})"
+        )
+
+    combined = segments[0]
+    for nxt, crossfade_ms in zip(segments[1:], fade_ms_list):
+        fade = min(int(crossfade_ms), len(combined) // 2, len(nxt) // 2)
         if fade < 20:
             combined = combined + nxt
         else:

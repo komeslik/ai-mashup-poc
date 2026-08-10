@@ -13,6 +13,11 @@
   const elapsedEl = document.getElementById("elapsed");
   const errorMsg = document.getElementById("error-msg");
   const downloadBtn = document.getElementById("download-btn");
+  const resultRow = document.getElementById("result-row");
+  const mashupAudio = document.getElementById("mashup-audio");
+  const playerPlay = document.getElementById("player-play");
+  const playerSeek = document.getElementById("player-seek");
+  const playerTime = document.getElementById("player-time");
   const vocalPolicy = document.getElementById("vocal-policy");
   const creativeMode = document.getElementById("creative-mode");
   const sectionEditor = document.getElementById("section-editor");
@@ -119,13 +124,63 @@
     errorMsg.textContent = "";
   }
 
+  function formatPlayerTime(sec) {
+    if (!Number.isFinite(sec) || sec < 0) sec = 0;
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return `${m}:${String(s).padStart(2, "0")}`;
+  }
+
+  function updatePlayerTimeLabel() {
+    if (!mashupAudio || !playerTime) return;
+    const cur = mashupAudio.currentTime || 0;
+    const dur = Number.isFinite(mashupAudio.duration) ? mashupAudio.duration : 0;
+    playerTime.textContent = `${formatPlayerTime(cur)} / ${formatPlayerTime(dur)}`;
+  }
+
+  function clearMashupPlayer() {
+    if (mashupAudio) {
+      mashupAudio.pause();
+      mashupAudio.removeAttribute("src");
+      mashupAudio.load();
+    }
+    if (playerPlay) playerPlay.textContent = "Play";
+    if (playerSeek) {
+      playerSeek.value = "0";
+      playerSeek.max = "0";
+    }
+    updatePlayerTimeLabel();
+  }
+
+  function showMashupResult(url) {
+    if (resultRow) resultRow.hidden = false;
+    if (downloadBtn) {
+      downloadBtn.href = url;
+      downloadBtn.hidden = false;
+    }
+    if (mashupAudio) {
+      mashupAudio.src = url;
+      mashupAudio.load();
+    }
+    if (playerPlay) playerPlay.textContent = "Play";
+    updatePlayerTimeLabel();
+  }
+
+  function hideMashupResult() {
+    if (resultRow) resultRow.hidden = true;
+    if (downloadBtn) {
+      downloadBtn.hidden = true;
+      downloadBtn.removeAttribute("href");
+    }
+    clearMashupPlayer();
+  }
+
   function resetResultUi() {
     if (objectUrl) {
       URL.revokeObjectURL(objectUrl);
       objectUrl = null;
     }
-    downloadBtn.hidden = true;
-    downloadBtn.removeAttribute("href");
+    hideMashupResult();
     if (sectionEditor) sectionEditor.hidden = true;
     if (rebuildBtn) rebuildBtn.hidden = true;
     if (phraseList) phraseList.innerHTML = "";
@@ -159,16 +214,44 @@
     const directorHint = document.getElementById("director-mode-hint");
     if (directorHint) {
       const strict = meta.director_strict !== false;
+      const shiftA = meta.shift_a != null ? Number(meta.shift_a) : null;
+      const shiftB = meta.shift_b != null ? Number(meta.shift_b) : null;
+      let mode = strict
+        ? "AI Director · Song A anchor · strict (one vocal)"
+        : "AI Director · Song A anchor · muted harmony allowed";
+      if (shiftA != null && shiftB != null) {
+        const fmt = (n) => (n >= 0 ? `+${n}` : `${n}`);
+        mode += ` · key A${fmt(shiftA)} · B${fmt(shiftB)}`;
+        if (meta.key_a && meta.key_b) {
+          mode += ` (${meta.key_a} / ${meta.key_b})`;
+        }
+      }
       directorHint.hidden = false;
-      directorHint.textContent = strict
-        ? "AI Director · strict (one vocal at a time)"
-        : "AI Director · muted harmony allowed (overlap hard-muted)";
+      directorHint.textContent = mode;
     }
     const arrangementHint = document.getElementById("arrangement-hint");
     if (arrangementHint) {
-      if (meta.arranging_reasoning) {
+      const hooks = meta.song_b_hooks;
+      let text = meta.arranging_reasoning || "";
+      if (hooks && hooks.interesting_elements) {
+        const stems = Array.isArray(hooks.preferred_overlay_stems)
+          ? hooks.preferred_overlay_stems.join(", ")
+          : "";
+        text = `${text}${text ? " — " : ""}B hooks: ${hooks.interesting_elements}${
+          stems ? ` [${stems}]` : ""
+        }`;
+      }
+      const formA = meta.form_a;
+      if (formA && (formA.style_notes || formA.time_signature_numerator)) {
+        const meter = formA.time_signature_numerator
+          ? `${formA.time_signature_numerator}/${formA.time_signature_denominator || 4}`
+          : "";
+        const style = formA.style_notes || "";
+        text = `${text}${text ? " · " : ""}A form ${meter}${style ? ` · ${style}` : ""}`;
+      }
+      if (text) {
         arrangementHint.hidden = false;
-        arrangementHint.textContent = meta.arranging_reasoning;
+        arrangementHint.textContent = text;
       } else {
         arrangementHint.hidden = true;
         arrangementHint.textContent = "";
@@ -181,9 +264,18 @@
         stemHint.hidden = false;
         stemHint.textContent = actions
           .map((a) => {
-            const bars = `${a.bar_start}–${a.bar_end}`;
+            const range =
+              a.section_start != null
+                ? `${a.section_start}–${a.section_end}`
+                : `${a.bar_start}–${a.bar_end}`;
             const vox = a.vocal_source === "none" ? "instr" : a.vocal_source;
-            return `bars ${bars}: ${vox}`;
+            const overlays =
+              a.overlay_from === "song_b" &&
+              Array.isArray(a.overlay_stems) &&
+              a.overlay_stems.length
+                ? `+${a.overlay_stems.join("/")}`
+                : "";
+            return `sec ${range}: ${vox}${overlays}`;
           })
           .join(" · ");
       } else {
@@ -198,10 +290,14 @@
       const checked = phrase.enabled !== false ? "checked" : "";
       const title = phrase.section_name || `S${phrase.index}`;
       const role = phrase.label ? ` · ${phrase.label}` : "";
+      const overlays =
+        Array.isArray(phrase.overlay_stems) && phrase.overlay_stems.length
+          ? ` · overlay ${phrase.overlay_stems.join("/")}`
+          : "";
       li.innerHTML = `
         <label>
           <input type="checkbox" data-phrase-index="${phrase.index}" ${checked} />
-          <span class="phrase-main">${title}${role} · ${phrase.lead}</span>
+          <span class="phrase-main">${title}${role} · ${phrase.lead}${overlays}</span>
           <span class="phrase-meta">
             score ${Number(phrase.mashability_score || 0).toFixed(2)}
             · rhythm ${Number(phrase.rhythmic_score || 0).toFixed(2)}
@@ -252,8 +348,7 @@
       const blob = await response.blob();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
       objectUrl = URL.createObjectURL(blob);
-      downloadBtn.href = objectUrl;
-      downloadBtn.hidden = false;
+      showMashupResult(objectUrl);
       const sessionResp = await fetch(`/api/mashup/sessions/${sessionId}`);
       if (sessionResp.ok) {
         mashupMeta = await sessionResp.json();
@@ -383,7 +478,7 @@
 
       timers.forEach(clearInterval);
       timers.length = 0;
-      downloadBtn.hidden = true;
+      hideMashupResult();
       progressWrap.hidden = false;
       progressBar.classList.remove("indeterminate");
       progressBar.classList.add("done");
@@ -393,12 +488,11 @@
       await sleep(450);
 
       progressWrap.hidden = true;
-      downloadBtn.href = objectUrl;
-      downloadBtn.hidden = false;
+      showMashupResult(objectUrl);
       if (mashupMeta) renderSectionEditor(mashupMeta);
     } catch (err) {
       progressWrap.hidden = true;
-      downloadBtn.hidden = true;
+      hideMashupResult();
       const message =
         err instanceof Error ? err.message : "Something went wrong during mashup.";
       showError(message);
@@ -416,5 +510,51 @@
   if (rebuildBtn) rebuildBtn.addEventListener("click", rebuildFromSelection);
   if (libraryRefresh) libraryRefresh.addEventListener("click", refreshLibrary);
   if (librarySearch) librarySearch.addEventListener("click", searchLibrary);
+
+  if (playerPlay && mashupAudio) {
+    playerPlay.addEventListener("click", async () => {
+      if (mashupAudio.paused) {
+        try {
+          await mashupAudio.play();
+          playerPlay.textContent = "Pause";
+        } catch {
+          playerPlay.textContent = "Play";
+        }
+      } else {
+        mashupAudio.pause();
+        playerPlay.textContent = "Play";
+      }
+    });
+    mashupAudio.addEventListener("play", () => {
+      playerPlay.textContent = "Pause";
+    });
+    mashupAudio.addEventListener("pause", () => {
+      playerPlay.textContent = "Play";
+    });
+    mashupAudio.addEventListener("ended", () => {
+      playerPlay.textContent = "Play";
+    });
+    mashupAudio.addEventListener("loadedmetadata", () => {
+      if (playerSeek) {
+        playerSeek.max = String(mashupAudio.duration || 0);
+        playerSeek.value = "0";
+      }
+      updatePlayerTimeLabel();
+    });
+    mashupAudio.addEventListener("timeupdate", () => {
+      if (playerSeek && !playerSeek.matches(":active")) {
+        playerSeek.value = String(mashupAudio.currentTime || 0);
+      }
+      updatePlayerTimeLabel();
+    });
+  }
+  if (playerSeek && mashupAudio) {
+    playerSeek.addEventListener("input", () => {
+      const t = Number(playerSeek.value);
+      if (Number.isFinite(t)) mashupAudio.currentTime = t;
+      updatePlayerTimeLabel();
+    });
+  }
+
   refreshLibrary();
 })();

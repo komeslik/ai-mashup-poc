@@ -20,6 +20,8 @@ SectionLabel = Literal[
     "chorus",
     "drop",
     "outro",
+    "bridge",
+    "other",
     "low",
     "high",
 ]
@@ -27,7 +29,7 @@ SectionLabel = Literal[
 
 @dataclass(frozen=True)
 class Phrase:
-    """A phrase span on a beat/downbeat grid."""
+    """A phrase span on a downbeat-aware beat grid."""
 
     index: int
     start_beat: int
@@ -50,6 +52,9 @@ class Section:
     vocal_density: float = 0.0
     bar_start: int = 0
     bar_end: int = 8
+    name: str = ""
+    description: str = ""
+    approx_beats: int = 0
 
     @property
     def duration_sec(self) -> float:
@@ -59,6 +64,7 @@ class Section:
         return {
             "index": self.index,
             "label": self.label,
+            "name": self.name or self.label,
             "start_sec": round(self.start_sec, 2),
             "end_sec": round(self.end_sec, 2),
             "energy": round(self.energy, 3),
@@ -67,18 +73,189 @@ class Section:
             "bars": self.bars,
             "bar_start": self.bar_start,
             "bar_end": self.bar_end,
+            "approx_beats": self.approx_beats,
+            "description": self.description,
         }
 
 
-def _estimate_downbeat_indices(beat_times: np.ndarray, y: np.ndarray, sr: int) -> np.ndarray:
+def normalize_section_label(raw: str) -> SectionLabel:
+    """Map free-form section names to our label enum."""
+    s = (raw or "").strip().lower()
+    if not s:
+        return "other"
+    if "intro" in s:
+        return "intro"
+    if "outro" in s or "fade" in s:
+        return "outro"
+    if "pre-chorus" in s or "prechorus" in s or "build" in s:
+        return "buildup"
+    if "drop" in s:
+        return "drop"
+    if "chorus" in s or "hook" in s or "refrain" in s:
+        return "chorus"
+    if "bridge" in s or "interlude" in s or "solo" in s or "break" in s:
+        return "bridge"
+    if "verse" in s or "groove" in s:
+        return "verse"
+    return "other"
+
+
+def snap_form_timestamps(
+    specs: list[dict],
+    measured_duration_sec: float,
+    *,
+    expected_duration_sec: float | None = None,
+) -> list[dict]:
     """
-    Estimate which beat indices are downbeats (bar starts) in 4/4.
+    Scale/clamp LLM section timestamps onto the uploaded file's measured duration.
+
+    Ensures contiguous coverage from 0 → measured_duration.
+    """
+    if measured_duration_sec <= 0:
+        raise ValueError("measured_duration_sec must be positive")
+    if not specs:
+        return [
+            {
+                "name": "Full track",
+                "label": "verse",
+                "start_sec": 0.0,
+                "end_sec": measured_duration_sec,
+                "approx_beats": 0,
+                "description": "",
+            }
+        ]
+
+    expected = float(expected_duration_sec or 0.0)
+    scale = 1.0
+    if expected > 1.0 and abs(expected - measured_duration_sec) > 1.5:
+        scale = measured_duration_sec / expected
+
+    scaled: list[dict] = []
+    for spec in specs:
+        start = float(spec.get("start_sec", 0.0)) * scale
+        end = float(spec.get("end_sec", start)) * scale
+        start = max(0.0, min(measured_duration_sec, start))
+        end = max(0.0, min(measured_duration_sec, end))
+        if end <= start + 0.05:
+            continue
+        scaled.append(
+            {
+                "name": str(spec.get("name") or spec.get("label") or "Section"),
+                "label": normalize_section_label(
+                    str(spec.get("label") or spec.get("name") or "")
+                ),
+                "start_sec": start,
+                "end_sec": end,
+                "approx_beats": int(spec.get("approx_beats") or 0),
+                "description": str(spec.get("description") or ""),
+            }
+        )
+
+    if not scaled:
+        return snap_form_timestamps([], measured_duration_sec)
+
+    # Sort and make contiguous.
+    scaled.sort(key=lambda s: s["start_sec"])
+    contiguous: list[dict] = []
+    cursor = 0.0
+    for i, sec in enumerate(scaled):
+        start = sec["start_sec"] if i == 0 else max(sec["start_sec"], cursor)
+        end = sec["end_sec"]
+        if i == 0:
+            start = 0.0
+        if i == len(scaled) - 1:
+            end = measured_duration_sec
+        if end <= start + 0.05:
+            continue
+        contiguous.append({**sec, "start_sec": start, "end_sec": end})
+        cursor = end
+
+    if not contiguous:
+        return snap_form_timestamps([], measured_duration_sec)
+    contiguous[0]["start_sec"] = 0.0
+    contiguous[-1]["end_sec"] = measured_duration_sec
+    # Force bookend labels when clear.
+    if contiguous[0]["label"] not in ("intro", "verse"):
+        contiguous[0]["label"] = "intro"
+    if contiguous[-1]["label"] not in ("outro", "chorus", "verse"):
+        contiguous[-1]["label"] = "outro"
+    return contiguous
+
+
+def sections_from_form_specs(
+    file_path: str,
+    specs: list[dict],
+    *,
+    bpm: float,
+    vocals_path: str | None = None,
+    meter_numerator: int = 4,
+) -> list[Section]:
+    """Build Section objects from snapped form specs, filling DSP features."""
+    y, sr = librosa.load(file_path, sr=None, mono=True)
+    beats_per_bar = max(2, int(meter_numerator))
+    sections: list[Section] = []
+    cumulative_bars = 0
+    for index, spec in enumerate(specs):
+        start = float(spec["start_sec"])
+        end = float(spec["end_sec"])
+        energy = _phrase_rms_energy(y, sr, start, end)
+        centroid = _phrase_spectral_centroid(y, sr, start, end)
+        dens = _phrase_vocal_density(
+            start_sec=start,
+            end_sec=end,
+            vocals_path=vocals_path,
+            y_mix=y,
+            sr=sr,
+        )
+        dur = max(0.01, end - start)
+        approx_beats = int(spec.get("approx_beats") or 0)
+        if approx_beats <= 0 and bpm > 0:
+            approx_beats = int(round(dur * (bpm / 60.0)))
+        bars = max(1, int(round(approx_beats / beats_per_bar))) if approx_beats else max(
+            1, int(round(dur * (bpm / 60.0) / beats_per_bar))
+        )
+        label = normalize_section_label(str(spec.get("label") or ""))
+        if index == 0:
+            label = "intro"
+        if index == len(specs) - 1:
+            label = "outro"
+        sections.append(
+            Section(
+                index=index,
+                start_sec=start,
+                end_sec=end,
+                label=label,
+                energy=energy,
+                bars=bars,
+                spectral_centroid=centroid,
+                vocal_density=dens,
+                bar_start=cumulative_bars,
+                bar_end=cumulative_bars + bars,
+                name=str(spec.get("name") or label),
+                description=str(spec.get("description") or ""),
+                approx_beats=approx_beats,
+            )
+        )
+        cumulative_bars += bars
+    return sections
+
+
+def _estimate_downbeat_indices(
+    beat_times: np.ndarray,
+    y: np.ndarray,
+    sr: int,
+    *,
+    meter_numerator: int = 4,
+) -> np.ndarray:
+    """
+    Estimate which beat indices are downbeats (bar starts).
 
     Combines onset-strength peaks at beats with a Foote-style novelty nudge, then
-    picks a phase (0..3) that maximizes energy on every 4th beat.
+    picks a phase that maximizes energy on every ``meter_numerator``-th beat.
     """
+    stride = max(2, int(meter_numerator))
     n = int(beat_times.size)
-    if n < 4:
+    if n < stride:
         return np.arange(0, n, max(n, 1), dtype=int)
 
     onset = librosa.onset.onset_strength(y=y, sr=sr)
@@ -105,12 +282,12 @@ def _estimate_downbeat_indices(beat_times: np.ndarray, y: np.ndarray, sr: int) -
     score = 0.7 * (beat_onset / (np.max(beat_onset) + 1e-8)) + 0.3 * novelty
     best_phase = 0
     best_val = -np.inf
-    for phase in range(4):
-        val = float(np.sum(score[phase::4]))
+    for phase in range(stride):
+        val = float(np.sum(score[phase::stride]))
         if val > best_val:
             best_val = val
             best_phase = phase
-    return np.arange(best_phase, n, 4, dtype=int)
+    return np.arange(best_phase, n, stride, dtype=int)
 
 
 def segment_phrases(
@@ -120,15 +297,17 @@ def segment_phrases(
     bars_per_phrase: int | None = None,
     max_phrases: int | None = 12,
     use_downbeats: bool = True,
+    meter_numerator: int = 4,
 ) -> list[Phrase]:
     """
     Split audio into phrase chunks on a downbeat-aware beat grid.
 
     Default ``beats_per_phrase=8`` ≈ two bars in 4/4. When ``bars_per_phrase`` is
-    set (e.g. 8 or 16), phrase length is ``bars_per_phrase * 4`` beats.
+    set (e.g. 8 or 16), phrase length is ``bars_per_phrase * meter_numerator`` beats.
     """
+    beats_per_bar = max(2, int(meter_numerator))
     if bars_per_phrase is not None:
-        beats_per_phrase = int(bars_per_phrase) * 4
+        beats_per_phrase = int(bars_per_phrase) * beats_per_bar
     if beats_per_phrase < 2:
         raise ValueError("beats_per_phrase must be >= 2")
 
@@ -149,7 +328,9 @@ def segment_phrases(
         ]
 
     if use_downbeats:
-        downbeats = _estimate_downbeat_indices(beat_times, y, sr)
+        downbeats = _estimate_downbeat_indices(
+            beat_times, y, sr, meter_numerator=beats_per_bar
+        )
         if downbeats.size == 0:
             starts = list(range(0, n_beats - beats_per_phrase, beats_per_phrase))
         else:
@@ -324,22 +505,28 @@ def detect_sections(
     file_path: str,
     *,
     bars_per_section: int = 8,
-    max_sections: int | None = 8,
+    max_sections: int | None = None,
     vocals_path: str | None = None,
+    meter_numerator: int = 4,
+    bpm: float | None = None,
 ) -> list[Section]:
     """
     Detect timed sections on a downbeat-aware bar grid with role labels.
 
     Labels use RMS energy, spectral centroid, and vocal density (from Demucs
-    vocals when ``vocals_path`` is provided).
+    vocals when ``vocals_path`` is provided). Default ``max_sections=None`` keeps
+    the full song (no 8-section cap). Last section is extended to song end;
+    first/last labels are forced to intro/outro.
     """
     phrases = segment_phrases(
         file_path,
         bars_per_phrase=bars_per_section,
         max_phrases=max_sections,
         use_downbeats=True,
+        meter_numerator=meter_numerator,
     )
     y, sr = librosa.load(file_path, sr=None, mono=True)
+    duration = float(librosa.get_duration(y=y, sr=sr))
     energies: list[float] = []
     centroids: list[float] = []
     densities: list[float] = []
@@ -358,23 +545,41 @@ def detect_sections(
             )
         )
     labels = _label_sections_rich(energies, centroids, densities)
+    if labels:
+        labels[0] = "intro"
+        labels[-1] = "outro"
+    beats_per_bar = max(2, int(meter_numerator))
     sections: list[Section] = []
     for phrase, energy, centroid, dens, label in zip(
         phrases, energies, centroids, densities, labels
     ):
+        end_sec = phrase.end_sec
+        if phrase.index == len(phrases) - 1:
+            end_sec = duration
+        dur = max(0.01, end_sec - phrase.start_sec)
+        approx_beats = 0
+        if bpm is not None and bpm > 0:
+            approx_beats = int(round(dur * (bpm / 60.0)))
+        else:
+            approx_beats = max(1, phrase.end_beat - phrase.start_beat)
+        bars = max(1, int(round(approx_beats / beats_per_bar))) if approx_beats else bars_per_section
         bar_start = phrase.index * bars_per_section
+        name = str(label)
         sections.append(
             Section(
                 index=phrase.index,
                 start_sec=phrase.start_sec,
-                end_sec=phrase.end_sec,
+                end_sec=end_sec,
                 label=label,
                 energy=float(energy),
-                bars=bars_per_section,
+                bars=bars,
                 spectral_centroid=float(centroid),
                 vocal_density=float(dens),
                 bar_start=bar_start,
-                bar_end=bar_start + bars_per_section,
+                bar_end=bar_start + bars,
+                name=name,
+                description="",
+                approx_beats=approx_beats,
             )
         )
     return sections

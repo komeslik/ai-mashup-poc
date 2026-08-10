@@ -13,6 +13,7 @@ from pydub import AudioSegment
 from services.agent import ArrangementSegment, MashupBlueprint
 from services.audio import (
     crossfade_concatenate,
+    crossfade_concatenate_adaptive,
     extract_audio_segment,
     fit_length,
     get_key,
@@ -41,6 +42,8 @@ STRETCH_EPSILON = 0.01
 VOCAL_HPF_HZ = 120.0
 INSTR_DUCK_DB = -2.5
 CROSSFADE_MS = 600
+CROSSFADE_LEAD_CHANGE_MS = 100
+CROSSFADE_BOOKEND_MS = 50
 DEFAULT_BARS_PER_SECTION = 8
 DEFAULT_MAX_SECTIONS = 8
 
@@ -72,6 +75,8 @@ class PhraseScheduleEntry:
     label: str | None = None
     high_pass_filter: bool = True
     vocal_volume_db: float = 0.0
+    overlay_stems: list[str] = field(default_factory=list)
+    overlay_from: str = "none"
 
 
 @dataclass
@@ -116,6 +121,9 @@ def _scale_sections_after_stretch(
             vocal_density=s.vocal_density,
             bar_start=s.bar_start,
             bar_end=s.bar_end,
+            name=s.name,
+            description=s.description,
+            approx_beats=s.approx_beats,
         )
         for s in sections
     ]
@@ -136,11 +144,16 @@ def _prepare_contiguous_lead(
     work_dir: Path,
     tag: str,
     weights: MashabilityWeights | None = None,
+    *,
+    fixed_n_steps: int | None = None,
+    already_pitched: bool = False,
 ) -> tuple[AudioSegment, dict[str, float | int | bool]]:
     """
-    Slice a contiguous vocal section; score/key-match against the instrumental section.
+    Slice a contiguous vocal section; score against the instrumental section.
 
-    Never searches the whole song for a different vocal window.
+    When *fixed_n_steps* is set (global key meeting), mashability only searches
+    windows — pitch is locked. If *already_pitched*, skip pitch shift (n_steps=0
+    for DSP; metadata still reports the planned shift).
     """
     vocal_clip = extract_audio_segment(
         vocal_path,
@@ -154,8 +167,13 @@ def _prepare_contiguous_lead(
             instrumental_phrase_path,
             weights=weights,
             window_beats=32,
+            fixed_n_steps=0 if already_pitched else fixed_n_steps,
         )
-        n_steps = int(alignment.n_steps)
+        n_steps = (
+            int(fixed_n_steps)
+            if fixed_n_steps is not None
+            else int(alignment.n_steps)
+        )
         scores: dict[str, float | int | bool] = {
             "mashability_score": float(alignment.score),
             "harmonic_score": float(alignment.harmonic_score),
@@ -164,8 +182,11 @@ def _prepare_contiguous_lead(
             "n_steps": n_steps,
         }
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Section mashability failed (%s); using key match", exc)
-        n_steps = _key_steps(vocal_clip, instrumental_phrase_path)
+        logger.warning("Section mashability failed (%s); using fixed/key match", exc)
+        if fixed_n_steps is not None:
+            n_steps = int(fixed_n_steps)
+        else:
+            n_steps = _key_steps(vocal_clip, instrumental_phrase_path)
         scores = {
             "mashability_score": 0.0,
             "harmonic_score": 0.0,
@@ -175,22 +196,40 @@ def _prepare_contiguous_lead(
         }
 
     logger.info(
-        "Section vocal %s — contiguous [%.1f–%.1f] score=%.3f n_steps=%+d",
+        "Section vocal %s — contiguous [%.1f–%.1f] score=%.3f n_steps=%+d pitched=%s",
         tag,
         vocal_section.start_sec,
         vocal_section.end_sec,
         scores["mashability_score"],
         scores["n_steps"],
+        already_pitched,
     )
     cents = 0.0
+    apply_steps = 0.0 if already_pitched else float(scores["n_steps"])
     pitched, cents = pitch_shift_with_cents(
         vocal_clip,
         str(work_dir / f"{tag}_pitched.wav"),
-        float(scores["n_steps"]),
+        apply_steps,
         apply_tuning_correction=True,
     )
     scores["cents"] = float(cents)
     return AudioSegment.from_file(pitched), scores
+
+
+def _pitch_shift_stem(
+    path: str,
+    output_path: str,
+    n_steps: int,
+) -> str:
+    if n_steps == 0:
+        return path
+    pitched, _ = pitch_shift_with_cents(
+        path,
+        output_path,
+        float(n_steps),
+        apply_tuning_correction=False,
+    )
+    return pitched
 
 
 def _lead_letter(vocal_source: str) -> Literal["a", "b"] | None:
@@ -199,6 +238,30 @@ def _lead_letter(vocal_source: str) -> Literal["a", "b"] | None:
     if vocal_source == "song_b":
         return "b"
     return None
+
+
+def _adaptive_fade_ms_list(lead_sequence: list[str | None]) -> list[int]:
+    """
+    Per-join fades: 100ms on lead change, 600ms same lead;
+    50ms on first and last bookend joins when possible.
+    """
+    n = len(lead_sequence)
+    if n <= 1:
+        return []
+    fades: list[int] = []
+    for i in range(n - 1):
+        prev = lead_sequence[i]
+        nxt = lead_sequence[i + 1]
+        if prev != nxt:
+            fades.append(CROSSFADE_LEAD_CHANGE_MS)
+        else:
+            fades.append(CROSSFADE_MS)
+    # Lighter bookend joins (intro→next and penultimate→outro).
+    if fades:
+        fades[0] = min(fades[0], CROSSFADE_BOOKEND_MS)
+    if len(fades) > 1:
+        fades[-1] = min(fades[-1], CROSSFADE_BOOKEND_MS)
+    return fades
 
 
 def _allows_harmony(policy: PhraseVocalPolicy) -> bool:
@@ -265,13 +328,30 @@ def build_dual_vocal_mashup(
     policy: PhraseVocalPolicy = "alternate",
     first_lead: Literal["a", "b"] = "a",
     bars_per_section: int = DEFAULT_BARS_PER_SECTION,
-    max_sections: int = DEFAULT_MAX_SECTIONS,
+    max_sections: int | None = DEFAULT_MAX_SECTIONS,
     weights: MashabilityWeights | None = None,
     creative_mode: CreativeMode = "forced_match",
     session_dir: Path | None = None,
     blueprint: MashupBlueprint | None = None,
     sections_a: list[Section] | None = None,
     sections_b: list[Section] | None = None,
+    # Global key-meeting shifts (applied once to stems before section mix).
+    shift_a: int = 0,
+    shift_b: int = 0,
+    key_a: str | None = None,
+    key_b: str | None = None,
+    meeting_pc: int | None = None,
+    # Optional Song B overlay stems.
+    drums_b: str | None = None,
+    bass_b: str | None = None,
+    other_b: str | None = None,
+    # Structure analysis metadata (optional; allin1 or DSP fallback).
+    form_a: dict[str, Any] | None = None,
+    form_b: dict[str, Any] | None = None,
+    structure_meta_a: dict[str, Any] | None = None,
+    structure_meta_b: dict[str, Any] | None = None,
+    meter_a: int | None = None,
+    meter_b: int | None = None,
     # Back-compat aliases from older call sites.
     beats_per_phrase: int = 8,
     bars_per_phrase: int | None = None,
@@ -280,14 +360,16 @@ def build_dual_vocal_mashup(
     """
     Build a mashup from contiguous section clips (macro structure).
 
-    When *blueprint* is provided, its timeline drives vocal/instrumental section picks.
-    Otherwise sections are detected on the instrumental bed and leads alternate.
+    Song A is the anchor bed. When *blueprint* is provided, its timeline drives
+    vocal/instrumental section picks and selective Song B stem overlays.
     """
     del beats_per_phrase  # unused; kept for call-site compatibility
     if bars_per_phrase is not None:
         bars_per_section = bars_per_phrase
     if max_phrases is not None:
         max_sections = max_phrases
+    # Fallback detect_sections always uncapped; max_sections kept for API compat.
+    _ = max_sections
 
     work_dir.mkdir(parents=True, exist_ok=True)
     if session_dir is None:
@@ -300,44 +382,83 @@ def build_dual_vocal_mashup(
     if creative_mode == "style_contrast":
         stretch_bpm = float(np_clip_tempo(target_bpm))
 
+    # Pitch-shift full stems once (minimal meeting key), then stretch to target BPM.
+    pitched_instr = _pitch_shift_stem(
+        instrumental, str(work_dir / "instr_pitched.wav"), shift_a
+    )
+    pitched_voc_a = _pitch_shift_stem(
+        vocals_a, str(work_dir / "vocals_a_pitched.wav"), shift_a
+    )
+    pitched_voc_b = _pitch_shift_stem(
+        vocals_b, str(work_dir / "vocals_b_pitched.wav"), shift_b
+    )
+    overlay_paths: dict[str, str] = {}
+    if drums_b:
+        overlay_paths["drums"] = _pitch_shift_stem(
+            drums_b, str(work_dir / "drums_b_pitched.wav"), shift_b
+        )
+    if bass_b:
+        overlay_paths["bass"] = _pitch_shift_stem(
+            bass_b, str(work_dir / "bass_b_pitched.wav"), shift_b
+        )
+    if other_b:
+        overlay_paths["other"] = _pitch_shift_stem(
+            other_b, str(work_dir / "other_b_pitched.wav"), shift_b
+        )
+
+    stretched_instr = _stretch_to_bpm(
+        pitched_instr,
+        str(work_dir / "instr_stretched.wav"),
+        bpm_a,
+        stretch_bpm,
+    )
     stretched_a = _stretch_to_bpm(
-        vocals_a,
+        pitched_voc_a,
         str(work_dir / "vocals_a_stretched.wav"),
         bpm_a,
         stretch_bpm,
     )
     stretched_b = _stretch_to_bpm(
-        vocals_b,
+        pitched_voc_b,
         str(work_dir / "vocals_b_stretched.wav"),
         bpm_b,
         stretch_bpm,
     )
+    stretched_overlays: dict[str, str] = {}
+    for name, path_stem in overlay_paths.items():
+        stretched_overlays[name] = _stretch_to_bpm(
+            path_stem,
+            str(work_dir / f"{name}_b_stretched.wav"),
+            bpm_b,
+            stretch_bpm,
+        )
 
+    # Fallback DSP path: uncapped sections (no max-8).
     if sections_a is None:
         sections_a = detect_sections(
-            vocals_a, bars_per_section=bars_per_section, max_sections=max_sections
+            vocals_a,
+            bars_per_section=bars_per_section,
+            max_sections=None,
+            meter_numerator=meter_a or 4,
+            bpm=bpm_a,
         )
     if sections_b is None:
         sections_b = detect_sections(
-            vocals_b, bars_per_section=bars_per_section, max_sections=max_sections
+            vocals_b,
+            bars_per_section=bars_per_section,
+            max_sections=None,
+            meter_numerator=meter_b or 4,
+            bpm=bpm_b,
         )
 
-    # Instrumental sections: prefer map from the instrumental-source song when
-    # blueprint is present; otherwise detect on the bed itself.
-    if blueprint is not None:
-        if blueprint.instrumental_source == "song_a":
-            sections_instr = list(sections_a)
-        else:
-            sections_instr = list(sections_b)
-    else:
-        sections_instr = detect_sections(
-            instrumental,
-            bars_per_section=bars_per_section,
-            max_sections=max_sections,
-        )
+    # Anchor: always use Song A section map for the instrumental bed.
+    sections_instr = list(sections_a)
 
     sections_a_stretched = _scale_sections_after_stretch(sections_a, bpm_a, stretch_bpm)
     sections_b_stretched = _scale_sections_after_stretch(sections_b, bpm_b, stretch_bpm)
+    sections_instr_stretched = _scale_sections_after_stretch(
+        sections_instr, bpm_a, stretch_bpm
+    )
 
     if blueprint is not None:
         timeline = list(blueprint.timeline)
@@ -347,18 +468,24 @@ def build_dual_vocal_mashup(
         )
 
     logger.info(
-        "Section mashup: %d segments, policy=%s, mode=%s, blueprint=%s",
+        "Section mashup: %d segments, policy=%s, mode=%s, shifts A%+d B%+d, overlays=%s",
         len(timeline),
         policy,
         creative_mode,
-        blueprint is not None,
+        shift_a,
+        shift_b,
+        list(stretched_overlays.keys()),
     )
 
     mixed_phrases: list[AudioSegment] = []
     schedule: list[PhraseScheduleEntry] = []
+    instrumental = stretched_instr
+    lead_sequence: list[str | None] = []
 
     for index, segment in enumerate(timeline):
-        instr_section = pick_section(sections_instr, segment.instrumental_section_index)
+        instr_section = pick_section(
+            sections_instr_stretched, segment.instrumental_section_index
+        )
         instr_phrase = extract_audio_segment(
             instrumental,
             str(work_dir / f"instr_section_{index}.wav"),
@@ -369,7 +496,6 @@ def build_dual_vocal_mashup(
         target_ms = len(instrumental_seg)
 
         lead = _lead_letter(segment.vocal_source)
-        # Director-strict: harmony only when UI/policy explicitly allows it.
         harmony = bool(segment.harmony) and _allows_harmony(policy)
         if not _allows_harmony(policy):
             harmony = False
@@ -384,14 +510,22 @@ def build_dual_vocal_mashup(
             "harmonic_score": 0.0,
             "rhythmic_score": 1.0,
             "spectral_score": 0.0,
-            "n_steps": 0,
+            "n_steps": shift_a if lead == "a" else (shift_b if lead == "b" else 0),
             "cents": 0.0,
         }
         lead_seg: AudioSegment | None = None
-        vocal_section_used: Section | None = None
         apply_hpf = bool(getattr(segment, "high_pass_filter", True))
         vocal_gain = float(getattr(segment, "vocal_volume_db", 0.0) or 0.0)
         instr_ducked_frames = 0
+        overlay_stems = list(getattr(segment, "overlay_stems", []) or [])
+        overlay_from = getattr(segment, "overlay_from", "none") or "none"
+        overlay_gain = float(getattr(segment, "overlay_volume_db", -6.0) or -6.0)
+
+        # Anti-bleed: never layer Demucs "other" under an active lead vocal.
+        if lead is not None:
+            overlay_stems = [s for s in overlay_stems if s != "other"]
+            if not overlay_stems:
+                overlay_from = "none"
 
         if lead is not None:
             if lead == "a":
@@ -399,11 +533,13 @@ def build_dual_vocal_mashup(
                 other_path = stretched_b
                 vocal_map = sections_a_stretched
                 other_map = sections_b_stretched
+                lead_shift = shift_a
             else:
                 lead_path = stretched_b
                 other_path = stretched_a
                 vocal_map = sections_b_stretched
                 other_map = sections_a_stretched
+                lead_shift = shift_b
 
             vocal_section_used = pick_section(vocal_map, segment.vocal_section_index)
             lead_seg, scores = _prepare_contiguous_lead(
@@ -413,7 +549,10 @@ def build_dual_vocal_mashup(
                 work_dir,
                 tag=f"s{index}_lead_{lead}",
                 weights=weights,
+                fixed_n_steps=lead_shift,
+                already_pitched=True,
             )
+            scores["n_steps"] = lead_shift
             lead_seg = fit_length(lead_seg, target_ms)
             lead_seg = _match_format(lead_seg, instrumental_seg)
             if apply_hpf:
@@ -425,7 +564,6 @@ def build_dual_vocal_mashup(
             if abs(vocal_gain) > 0.01:
                 lead_seg = lead_seg.apply_gain(vocal_gain)
 
-            # Sidechain-style instrumental duck under active vocals.
             try:
                 ducked = duck_instrumental_under_vocals(
                     instrumental_seg,
@@ -436,6 +574,34 @@ def build_dual_vocal_mashup(
                 instr_ducked_frames = ducked.ducked_frames
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Instrumental duck failed: %s", exc)
+
+        if overlay_from == "song_b" and overlay_stems and stretched_overlays:
+            b_idx = (
+                segment.vocal_section_index
+                if segment.vocal_source == "song_b"
+                else min(index, max(len(sections_b_stretched) - 1, 0))
+            )
+            b_sec = pick_section(sections_b_stretched, b_idx)
+            for stem_name in overlay_stems:
+                stem_path = stretched_overlays.get(stem_name)
+                if not stem_path:
+                    continue
+                try:
+                    clip = extract_audio_segment(
+                        stem_path,
+                        str(work_dir / f"overlay_{stem_name}_{index}.wav"),
+                        b_sec.start_sec,
+                        b_sec.end_sec,
+                    )
+                    overlay_seg = AudioSegment.from_file(clip)
+                    overlay_seg = fit_length(overlay_seg, target_ms)
+                    overlay_seg = _match_format(overlay_seg, instrumental_seg)
+                    overlay_seg = overlay_seg.apply_gain(overlay_gain)
+                    instrumental_seg = instrumental_seg.overlay(overlay_seg)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Overlay %s failed on segment %d: %s", stem_name, index, exc
+                    )
 
         phrase_mix = canvas.overlay(instrumental_seg)
         if lead_seg is not None:
@@ -467,6 +633,7 @@ def build_dual_vocal_mashup(
                         (s for s in other_map if is_high_energy_label(s.label)),
                         other_section,
                     )
+                    other_shift = shift_b if lead == "a" else shift_a
                     harmony_seg, _ = _prepare_contiguous_lead(
                         other_path,
                         high_other,
@@ -474,6 +641,8 @@ def build_dual_vocal_mashup(
                         work_dir,
                         tag=f"s{index}_harm",
                         weights=weights,
+                        fixed_n_steps=other_shift,
+                        already_pitched=True,
                     )
                     harmony_seg = fit_length(harmony_seg, target_ms)
                     harmony_seg = _match_format(harmony_seg, instrumental_seg)
@@ -489,7 +658,6 @@ def build_dual_vocal_mashup(
                         instrumental_seg,
                         target_offset_db=HARMONY_GAIN_DB,
                     )
-                    # Hard mute on overlap — never leave two active leads.
                     vad = apply_overlap_mute(lead_seg, harmony_seg)
                     harmony_seg = vad.segment
                     vad_overlap = vad.overlap_frames
@@ -503,8 +671,10 @@ def build_dual_vocal_mashup(
         phrase_file = phrases_dir / f"phrase_{index:02d}.mp3"
         phrase_mix.export(str(phrase_file), format="mp3")
         mixed_phrases.append(phrase_mix)
+        lead_sequence.append(lead)
 
         lead_label = f"song_{lead}" if lead else "none"
+        applied_overlays = list(overlay_stems) if overlay_from == "song_b" else []
         entry = PhraseScheduleEntry(
             index=index,
             lead=lead_label,
@@ -531,23 +701,26 @@ def build_dual_vocal_mashup(
             label=instr_section.label,
             high_pass_filter=apply_hpf,
             vocal_volume_db=vocal_gain,
+            overlay_stems=applied_overlays,
+            overlay_from=overlay_from if applied_overlays else "none",
         )
         schedule.append(entry)
         logger.info(
-            "Segment %d — %s lead=%s score=%.3f duration_ms=%d muted=%d instr_duck=%d",
+            "Segment %d — %s lead=%s score=%.3f duration_ms=%d muted=%d overlays=%s",
             index,
             segment.section_name,
             entry.lead,
             entry.mashability_score,
             target_ms,
             vad_muted,
-            instr_ducked_frames,
+            entry.overlay_stems,
         )
 
     if not mixed_phrases:
         raise RuntimeError("No sections were produced for dual-vocal mashup")
 
-    combined = crossfade_concatenate(mixed_phrases, crossfade_ms=CROSSFADE_MS)
+    fade_ms_list = _adaptive_fade_ms_list(lead_sequence)
+    combined = crossfade_concatenate_adaptive(mixed_phrases, fade_ms_list)
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     combined.export(str(out), format="mp3")
@@ -559,17 +732,48 @@ def build_dual_vocal_mashup(
         "target_bpm": target_bpm,
         "bars_per_section": bars_per_section,
         "director_strict": not _allows_harmony(policy),
+        "anchor": "song_a",
         "crossfade_ms": CROSSFADE_MS,
+        "crossfade_adaptive_ms": fade_ms_list,
         "instr_duck_db": INSTR_DUCK_DB,
+        "key_a": key_a,
+        "key_b": key_b,
+        "meeting_pc": meeting_pc,
+        "shift_a": shift_a,
+        "shift_b": shift_b,
+        "shift_total": abs(shift_a) + abs(shift_b),
         "phrases": [asdict(p) for p in schedule],
         "sections_a": [s.to_prompt_dict() for s in sections_a],
         "sections_b": [s.to_prompt_dict() for s in sections_b],
     }
+    if meter_a is not None:
+        metadata["meter_a"] = meter_a
+    if meter_b is not None:
+        metadata["meter_b"] = meter_b
+    if form_a is not None:
+        metadata["form_a"] = form_a
+    if form_b is not None:
+        metadata["form_b"] = form_b
+    if structure_meta_a is not None:
+        metadata["structure_a"] = structure_meta_a
+        metadata["structure_source_a"] = structure_meta_a.get("structure_source")
+    if structure_meta_b is not None:
+        metadata["structure_b"] = structure_meta_b
+        metadata["structure_source_b"] = structure_meta_b.get("structure_source")
+    # Convenience: primary source when both songs agree, else per-song keys above.
+    src_a = (structure_meta_a or {}).get("structure_source")
+    src_b = (structure_meta_b or {}).get("structure_source")
+    if src_a and src_b:
+        metadata["structure_source"] = src_a if src_a == src_b else f"{src_a}+{src_b}"
+    elif src_a or src_b:
+        metadata["structure_source"] = src_a or src_b
     if blueprint is not None:
         metadata["blueprint"] = blueprint.model_dump()
         metadata["arranging_reasoning"] = blueprint.arranging_reasoning
         if blueprint.actions:
             metadata["stem_actions"] = [a.model_dump() for a in blueprint.actions]
+        if blueprint.song_b_hooks is not None:
+            metadata["song_b_hooks"] = blueprint.song_b_hooks.model_dump()
 
     meta_path = session_dir / "metadata.json"
     meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")

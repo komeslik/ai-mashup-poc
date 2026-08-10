@@ -19,7 +19,7 @@
         <p class="brand">MASHUP</p>
         <h1>Drop two tracks. Get one blend.</h1>
         <p class="lede">
-          AI Director arrangements, role-mapped sections, one-vocal anti-collision.
+          Song A anchor bed, minimal key meeting, selective Song B overlays.
         </p>
       </header>
 
@@ -110,9 +110,28 @@
 
         <p class="error" id="error-msg" hidden></p>
 
-        <a class="btn-download" id="download-btn" hidden download="mashup.mp3">
-          Download mashup.mp3
-        </a>
+        <div class="result-row" id="result-row" hidden>
+          <a class="btn-download" id="download-btn" download="mashup.mp3">
+            Download mashup.mp3
+          </a>
+          <div class="mashup-player" id="mashup-player-wrap">
+            <audio id="mashup-audio" preload="metadata"></audio>
+            <button type="button" class="btn-secondary player-play" id="player-play" aria-label="Play">
+              Play
+            </button>
+            <input
+              type="range"
+              class="player-seek"
+              id="player-seek"
+              min="0"
+              max="0"
+              value="0"
+              step="0.1"
+              aria-label="Seek"
+            />
+            <span class="player-time" id="player-time">0:00 / 0:00</span>
+          </div>
+        </div>
 
         <section class="section-editor" id="section-editor" hidden>
           <h2 class="editor-title">Section editor</h2>

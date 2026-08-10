@@ -25,8 +25,9 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from services.agent import MashupDecision, decide_arrangement, decide_mashup_strategy
-from services.audio import get_bpm
-from services.demucs import DemucsError, separate_full_stems, separate_stems
+from services.audio import get_bpm, get_key, minimal_meeting_shifts
+from services.allin1_structure import resolve_sections_for_song
+from services.demucs import DemucsError, separate_full_stems
 from services.dual_mix import (
     CreativeMode,
     PhraseVocalPolicy,
@@ -36,7 +37,6 @@ from services.dual_mix import (
 )
 from services.library import list_library_tracks, rank_library_against_query
 from services.mashability import MashabilityWeights
-from services.structure import detect_sections
 
 load_dotenv()
 
@@ -78,18 +78,6 @@ def _save_upload(upload: UploadFile, destination: Path) -> Path:
     with destination.open("wb") as handle:
         shutil.copyfileobj(upload.file, handle)
     return destination
-
-
-def _instrumental_path(
-    decision: MashupDecision,
-    stems_a: tuple[str, str],
-    stems_b: tuple[str, str],
-) -> str:
-    _, instrumental_a = stems_a
-    _, instrumental_b = stems_b
-    if decision.instrumental_source == "song_a":
-        return instrumental_a
-    return instrumental_b
 
 
 def _resolve_policy(
@@ -252,32 +240,75 @@ async def create_mashup(
                     first_lead = "a" if decision.vocal_source == "song_a" else "b"
                     policy = _resolve_policy(vocal_policy, decision)
                 else:
-                    logger.info("Two-stem Demucs for vocal mashup")
-                    stems_a = await asyncio.to_thread(
-                        separate_stems, str(song_a_path), str(stems_a_dir)
+                    logger.info("Full Demucs stems for Song A anchor mashup")
+                    full_a = await asyncio.to_thread(
+                        separate_full_stems, str(song_a_path), str(stems_a_dir)
                     )
-                    stems_b = await asyncio.to_thread(
-                        separate_stems, str(song_b_path), str(stems_b_dir)
+                    full_b = await asyncio.to_thread(
+                        separate_full_stems, str(song_b_path), str(stems_b_dir)
                     )
-                    vocals_a, instr_a = stems_a
-                    vocals_b, instr_b = stems_b
+                    vocals_a = full_a.vocals
+                    vocals_b = full_b.vocals
+                    instr_a = full_a.instrumental
 
-                    # Role maps after Demucs so vocal_density uses vocal stems.
-                    sections_a = await asyncio.to_thread(
-                        detect_sections,
+                    # allin1 (or DSP fallback) structure on original uploads.
+                    struct_dir = work / "structure"
+                    struct_dir.mkdir(exist_ok=True)
+                    sections_a, form_a, form_meta_a = await asyncio.to_thread(
+                        resolve_sections_for_song,
                         str(song_a_path),
-                        vocals_path=vocals_a,
+                        title_a,
+                        bpm_a,
+                        vocals_a,
+                        work_dir=struct_dir / "a",
                     )
-                    sections_b = await asyncio.to_thread(
-                        detect_sections,
+                    sections_b, form_b, form_meta_b = await asyncio.to_thread(
+                        resolve_sections_for_song,
                         str(song_b_path),
-                        vocals_path=vocals_b,
+                        title_b,
+                        bpm_b,
+                        vocals_b,
+                        work_dir=struct_dir / "b",
                     )
+                    # Prefer allin1 BPM when available.
+                    if form_meta_a.get("structure_source") == "allin1" and form_meta_a.get(
+                        "bpm"
+                    ):
+                        bpm_a = float(form_meta_a["bpm"])
+                    if form_meta_b.get("structure_source") == "allin1" and form_meta_b.get(
+                        "bpm"
+                    ):
+                        bpm_b = float(form_meta_b["bpm"])
+                    meter_a = int(form_meta_a.get("meter_numerator") or 4)
+                    meter_b = int(form_meta_b.get("meter_numerator") or 4)
                     logger.info(
-                        "Sections — A: %d, B: %d",
+                        "Sections — A: %d (%s bpm=%.2f), B: %d (%s bpm=%.2f)",
                         len(sections_a),
+                        form_meta_a.get("structure_source") or form_meta_a.get("source"),
+                        bpm_a,
                         len(sections_b),
+                        form_meta_b.get("structure_source") or form_meta_b.get("source"),
+                        bpm_b,
                     )
+
+                    try:
+                        key_a = await asyncio.to_thread(get_key, str(song_a_path))
+                        key_b = await asyncio.to_thread(get_key, str(song_b_path))
+                        shift_a, shift_b, meeting_pc = minimal_meeting_shifts(
+                            key_a, key_b
+                        )
+                        logger.info(
+                            "Key meeting — A %s / B %s → pc=%d shifts A%+d B%+d",
+                            key_a,
+                            key_b,
+                            meeting_pc,
+                            shift_a,
+                            shift_b,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Key meeting failed (%s); shifts=0", exc)
+                        key_a, key_b, meeting_pc = None, None, None
+                        shift_a, shift_b = 0, 0
 
                     allow_harmony = _allow_harmony(vocal_policy)
 
@@ -338,14 +369,12 @@ async def create_mashup(
                         session_dir=session_dir,
                     )
                 else:
-                    instrumental_path = (
-                        instr_a if decision.instrumental_source == "song_a" else instr_b
-                    )
+                    # Song A is always the instrumental anchor bed.
                     result = await asyncio.to_thread(
                         build_dual_vocal_mashup,
                         vocals_a=vocals_a,
                         vocals_b=vocals_b,
-                        instrumental=instrumental_path,
+                        instrumental=instr_a,
                         bpm_a=bpm_a,
                         bpm_b=bpm_b,
                         target_bpm=decision.target_bpm,
@@ -359,6 +388,20 @@ async def create_mashup(
                         blueprint=blueprint,
                         sections_a=sections_a,
                         sections_b=sections_b,
+                        shift_a=shift_a,
+                        shift_b=shift_b,
+                        key_a=key_a,
+                        key_b=key_b,
+                        meeting_pc=meeting_pc,
+                        drums_b=full_b.drums,
+                        bass_b=full_b.bass,
+                        other_b=full_b.other,
+                        form_a=form_a if isinstance(form_a, dict) else form_meta_a,
+                        form_b=form_b if isinstance(form_b, dict) else form_meta_b,
+                        structure_meta_a=form_meta_a,
+                        structure_meta_b=form_meta_b,
+                        meter_a=meter_a,
+                        meter_b=meter_b,
                     )
             except DemucsError as exc:
                 raise HTTPException(status_code=500, detail=str(exc)) from exc

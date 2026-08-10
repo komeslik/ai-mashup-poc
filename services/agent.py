@@ -11,12 +11,14 @@ from openai import OpenAI
 from pydantic import BaseModel, Field, model_validator
 
 from services.audio import tempo_aware_stretch_rate
-from services.structure import Section, is_high_energy_label, section_index_for_bar
+from services.structure import Section, is_high_energy_label
 
 logger = logging.getLogger(__name__)
 
 SongSource = Literal["song_a", "song_b"]
 VocalPick = Literal["song_a", "song_b", "none"]
+OverlayStem = Literal["drums", "bass", "other"]
+OverlayFrom = Literal["song_b", "none"]
 ProviderName = Literal["openai", "gemini"]
 PhraseVocalPolicy = Literal["alternate", "a_lead_b_harmony", "b_lead_a_harmony"]
 
@@ -35,23 +37,34 @@ SYSTEM_PROMPT = (
 
 ARRANGEMENT_SYSTEM_PROMPT = (
     "You are an expert audio arrangement engineer (AI DJ Director) for two-song mashups. "
-    "You receive ROLE MAPS per 8-bar section with labels: intro, verse, buildup, chorus, "
-    "drop, outro — plus energy, spectral_centroid, and vocal_density. "
-    "Design a StemAction timeline snapped to 8-bar boundaries (bar_start % 8 == 0, "
-    "bar_end > bar_start, both multiples of 8). "
+    "Song A is ALWAYS the ANCHOR: its instrumental bed (drums+bass+other) is the spine "
+    "of the entire mashup. Song B only contributes vocals and selective stem overlays "
+    "(drums / bass / other) — never replace Song A's bed wholesale. "
+    "You receive ROLE MAPS as form sections with labels: intro, verse, buildup, chorus, "
+    "drop, bridge, outro — plus energy, spectral_centroid, vocal_density, and indices. "
+    "First fill song_b_hooks describing what is musically interesting about Song B "
+    "(e.g. darbuka in drums) and which overlay stems to prefer (default drums). "
+    "Then design a StemAction timeline using SECTION INDICES: "
+    "section_start inclusive, section_end exclusive on Song A's section map "
+    "(section_end > section_start; indices must stay inside the map). "
     "STRICT RULES: "
-    "(1) NEVER assign two vocal sources to the same bars — vocal_source is song_a OR "
-    "song_b OR none (never both). "
-    "(2) Align chorus/drop vocals over high-energy instrumental chorus/drop sections. "
-    "(3) Prefer vocal_source=none on buildup bars so the instrumental can shine. "
-    "(4) Feature BOTH singers across the mashup (section swap / call-and-response). "
-    "(5) Keep 3–6 actions. "
-    "(6) instrumental_source is constant for the whole mashup and must differ from the "
-    "primary vocal_source. "
-    "(7) target_bpm is usually the instrumental song BPM; stretch_factor MUST equal "
-    "target_bpm / primary vocal BPM (tempo-octave OK). "
-    "(8) high_pass_filter should be true for vocal beds; vocal_volume_db is usually 0. "
-    "(9) Titles are creative context only — never invent bars that are not in the maps."
+    "(1) instrumental_source MUST be song_a on every action. "
+    "(2) NEVER two lead vocals on the same sections — vocal_source is song_a OR song_b OR none. "
+    "(3) Chronological Song A spine: first action MUST use Song A's intro (section 0) "
+    "with vocal_source song_a (or none); last action MUST use Song A's outro "
+    "(final section index) with vocal_source song_a (or none). "
+    "(4) Middle: walk A section indices forward; feature Song B vocals / drums overlays "
+    "on selected middle sections only. "
+    "(5) Feature BOTH singers: at least one verse-like and one chorus-like block for each. "
+    "(6) Prefer vocal_source=none on buildup sections. "
+    "(7) Under active lead vocals (song_a or song_b), NEVER use overlay stem 'other' "
+    "(Demucs residue bleed); drums only (bass rare). 'other' only when vocal_source=none. "
+    "(8) overlay_from=song_b only for short sections; overlay_stems must be subset of "
+    "song_b_hooks.preferred_overlay_stems; keep overlay_volume_db around -6. "
+    "(9) Keep 4–7 actions. "
+    "(10) target_bpm is Song A BPM; stretch_factor = target_bpm / Song A BPM (tempo-octave OK). "
+    "(11) vocal_source primary field should be song_a (first featured singer). "
+    "(12) Never invent section indices outside the maps; titles are creative context only."
 )
 
 
@@ -78,11 +91,7 @@ class MashupDecision(BaseModel):
     )
 
     @model_validator(mode="after")
-    def sources_must_differ(self) -> MashupDecision:
-        if self.vocal_source == self.instrumental_source:
-            raise ValueError(
-                "vocal_source and instrumental_source must come from different songs"
-            )
+    def validate_decision(self) -> MashupDecision:
         if self.target_bpm <= 0:
             raise ValueError("target_bpm must be positive")
         if self.stretch_factor <= 0:
@@ -90,16 +99,49 @@ class MashupDecision(BaseModel):
         return self
 
 
-class StemAction(BaseModel):
-    """One 8-bar-snapped stem schedule block for the AI Director."""
+class SongBHookPlan(BaseModel):
+    """What is musically interesting to lift from Song B onto the Song A bed."""
 
-    bar_start: int = Field(description="Inclusive start bar; multiple of 8.")
-    bar_end: int = Field(description="Exclusive end bar; multiple of 8.")
+    interesting_elements: str = Field(
+        description="Short description of cool Song B elements (e.g. darbuka, flute)."
+    )
+    preferred_overlay_stems: list[OverlayStem] = Field(
+        default_factory=lambda: ["drums"],
+        description="Demucs stems from Song B worth overlaying (prefer drums).",
+    )
+    avoid: str = Field(
+        default="",
+        description="What not to lift from Song B (e.g. full bed, muddy bass).",
+    )
+
+
+class StemAction(BaseModel):
+    """One section-index stem schedule block for the AI Director."""
+
+    section_start: int = Field(
+        description="Inclusive start section index on Song A's form map."
+    )
+    section_end: int = Field(
+        description="Exclusive end section index on Song A's form map."
+    )
     vocal_source: VocalPick = Field(
-        description="Single vocal source for these bars, or none."
+        description="Single vocal source for these sections, or none."
     )
     instrumental_source: SongSource = Field(
-        description="Instrumental bed source (usually constant across actions)."
+        default="song_a",
+        description="Instrumental bed source — always song_a (anchor).",
+    )
+    overlay_stems: list[OverlayStem] = Field(
+        default_factory=list,
+        description="Selective Song B stems to layer on the A bed.",
+    )
+    overlay_from: OverlayFrom = Field(
+        default="none",
+        description="song_b to enable overlays; none for bed+vocals only.",
+    )
+    overlay_volume_db: float = Field(
+        default=-6.0,
+        description="Gain for Song B stem overlays.",
     )
     vocal_volume_db: float = Field(
         default=0.0,
@@ -115,11 +157,24 @@ class StemAction(BaseModel):
     )
 
     @model_validator(mode="after")
-    def bars_must_snap(self) -> StemAction:
-        if self.bar_end <= self.bar_start:
-            raise ValueError("bar_end must be > bar_start")
-        if self.bar_start % 8 != 0 or self.bar_end % 8 != 0:
-            raise ValueError("bar_start and bar_end must be multiples of 8")
+    def sections_must_be_valid(self) -> StemAction:
+        if self.section_end <= self.section_start:
+            raise ValueError("section_end must be > section_start")
+        if self.section_start < 0:
+            raise ValueError("section_start must be >= 0")
+        if self.instrumental_source != "song_a":
+            object.__setattr__(self, "instrumental_source", "song_a")
+        stems = list(self.overlay_stems)
+        if self.vocal_source != "none":
+            stems = [s for s in stems if s != "other"]
+        if self.overlay_from == "none":
+            stems = []
+        elif stems and self.overlay_from != "song_b":
+            object.__setattr__(self, "overlay_from", "song_b")
+        if self.overlay_from == "song_b" and not stems:
+            object.__setattr__(self, "overlay_from", "none")
+            stems = []
+        object.__setattr__(self, "overlay_stems", stems)
         return self
 
 
@@ -144,38 +199,47 @@ class ArrangementSegment(BaseModel):
     )
     vocal_volume_db: float = Field(default=0.0)
     high_pass_filter: bool = Field(default=True)
+    overlay_stems: list[OverlayStem] = Field(default_factory=list)
+    overlay_from: OverlayFrom = Field(default="none")
+    overlay_volume_db: float = Field(default=-6.0)
 
 
 class ArrangementBlueprint(BaseModel):
-    """LLM DJ Director bar-snapped stem plan (preferred schema)."""
+    """LLM DJ Director section-index stem plan (preferred schema)."""
 
     arrangement_reasoning: str = Field(
         description="Brief explanation of the arrangement arc."
     )
+    song_b_hooks: SongBHookPlan = Field(
+        default_factory=lambda: SongBHookPlan(
+            interesting_elements="unspecified",
+            preferred_overlay_stems=["drums"],
+            avoid="full instrumental bed",
+        ),
+        description="What to lift from Song B onto the Song A anchor bed.",
+    )
     instrumental_source: SongSource = Field(
-        description="Which song supplies the instrumental bed for the whole mashup."
+        default="song_a",
+        description="Always song_a — the anchor bed.",
     )
     vocal_source: SongSource = Field(
-        description="Which vocal leads first / is primary."
+        default="song_a",
+        description="Which vocal leads first / is primary (usually song_a).",
     )
-    target_bpm: float = Field(description="BPM to align the mashup to.")
+    target_bpm: float = Field(description="BPM to align the mashup to (Song A).")
     stretch_factor: float = Field(
-        description="target_bpm / vocal_source BPM (tempo-octave OK).",
+        description="target_bpm / Song A BPM (tempo-octave OK).",
     )
     phrase_vocal_policy: PhraseVocalPolicy = Field(
         default="alternate",
         description="Harmony only when UI selects a harmony policy; director default is alternate.",
     )
     actions: list[StemAction] = Field(
-        description="Ordered 8-bar-snapped stem actions."
+        description="Ordered section-index stem actions."
     )
 
     @model_validator(mode="after")
     def validate_arrangement(self) -> ArrangementBlueprint:
-        if self.vocal_source == self.instrumental_source:
-            raise ValueError(
-                "vocal_source and instrumental_source must come from different songs"
-            )
         if self.target_bpm <= 0:
             raise ValueError("target_bpm must be positive")
         if self.stretch_factor <= 0:
@@ -184,10 +248,30 @@ class ArrangementBlueprint(BaseModel):
             raise ValueError("actions must contain at least one StemAction")
         if len(self.actions) > 8:
             raise ValueError("actions too long; keep at most 8")
-        # Enforce constant instrumental bed.
+        # Force Song A anchor bed on the blueprint and every action.
+        object.__setattr__(self, "instrumental_source", "song_a")
+        allowed = set(self.song_b_hooks.preferred_overlay_stems)
+        fixed_actions: list[StemAction] = []
         for action in self.actions:
-            if action.instrumental_source != self.instrumental_source:
-                raise ValueError("all StemActions must share instrumental_source")
+            stems = [s for s in action.overlay_stems if s in allowed] if allowed else []
+            if not allowed:
+                stems = list(action.overlay_stems)
+            if action.vocal_source != "none":
+                stems = [s for s in stems if s != "other"]
+            fixed_actions.append(
+                action.model_copy(
+                    update={
+                        "instrumental_source": "song_a",
+                        "overlay_stems": stems if action.overlay_from == "song_b" else [],
+                        "overlay_from": (
+                            "song_b"
+                            if action.overlay_from == "song_b" and stems
+                            else "none"
+                        ),
+                    }
+                )
+            )
+        object.__setattr__(self, "actions", fixed_actions)
         return self
 
 
@@ -198,14 +282,16 @@ class MashupBlueprint(BaseModel):
         description="Brief explanation of the arrangement arc."
     )
     instrumental_source: SongSource = Field(
-        description="Which song supplies the instrumental bed for the whole mashup."
+        default="song_a",
+        description="Always song_a — the anchor bed.",
     )
     vocal_source: SongSource = Field(
-        description="Which vocal leads first / is primary."
+        default="song_a",
+        description="Which vocal leads first / is primary.",
     )
     target_bpm: float = Field(description="BPM to align the mashup to.")
     stretch_factor: float = Field(
-        description="target_bpm / vocal_source BPM (tempo-octave OK).",
+        description="target_bpm / Song A BPM (tempo-octave OK).",
     )
     phrase_vocal_policy: PhraseVocalPolicy = Field(
         default="alternate",
@@ -218,13 +304,13 @@ class MashupBlueprint(BaseModel):
         default_factory=list,
         description="Optional original StemAction list for metadata.",
     )
+    song_b_hooks: SongBHookPlan | None = Field(
+        default=None,
+        description="Hook plan from the director for metadata / UI.",
+    )
 
     @model_validator(mode="after")
     def validate_blueprint(self) -> MashupBlueprint:
-        if self.vocal_source == self.instrumental_source:
-            raise ValueError(
-                "vocal_source and instrumental_source must come from different songs"
-            )
         if self.target_bpm <= 0:
             raise ValueError("target_bpm must be positive")
         if self.stretch_factor <= 0:
@@ -233,12 +319,13 @@ class MashupBlueprint(BaseModel):
             raise ValueError("timeline must contain at least one segment")
         if len(self.timeline) > 8:
             raise ValueError("timeline too long; keep at most 8 segments")
+        object.__setattr__(self, "instrumental_source", "song_a")
         return self
 
     def as_decision(self) -> MashupDecision:
         return MashupDecision(
             vocal_source=self.vocal_source,
-            instrumental_source=self.instrumental_source,
+            instrumental_source="song_a",
             target_bpm=self.target_bpm,
             stretch_factor=self.stretch_factor,
             phrase_vocal_policy=self.phrase_vocal_policy,
@@ -246,12 +333,13 @@ class MashupBlueprint(BaseModel):
 
 
 def _fallback_decision(song_a_bpm: float, song_b_bpm: float) -> MashupDecision:
-    """Deterministic POC fallback: B instrumental, alternate vocals starting with A."""
-    target_bpm = float(song_b_bpm)
+    """Deterministic POC fallback: Song A anchor bed, A vocals first."""
+    del song_b_bpm
+    target_bpm = float(song_a_bpm)
     stretch_factor = tempo_aware_stretch_rate(float(song_a_bpm), target_bpm)
     return MashupDecision(
         vocal_source="song_a",
-        instrumental_source="song_b",
+        instrumental_source="song_a",
         target_bpm=target_bpm,
         stretch_factor=stretch_factor,
         phrase_vocal_policy="alternate",
@@ -274,8 +362,9 @@ def _normalize_blueprint_stretch(
     song_a_bpm: float,
     song_b_bpm: float,
 ) -> MashupBlueprint:
-    vocal_bpm = song_a_bpm if blueprint.vocal_source == "song_a" else song_b_bpm
-    stretch_factor = tempo_aware_stretch_rate(vocal_bpm, blueprint.target_bpm)
+    del song_b_bpm
+    # Anchor mashups stretch everything to Song A / target (usually A BPM).
+    stretch_factor = tempo_aware_stretch_rate(song_a_bpm, blueprint.target_bpm)
     return blueprint.model_copy(update={"stretch_factor": stretch_factor})
 
 
@@ -284,9 +373,29 @@ def _normalize_arrangement_stretch(
     song_a_bpm: float,
     song_b_bpm: float,
 ) -> ArrangementBlueprint:
-    vocal_bpm = song_a_bpm if arrangement.vocal_source == "song_a" else song_b_bpm
-    stretch_factor = tempo_aware_stretch_rate(vocal_bpm, arrangement.target_bpm)
-    return arrangement.model_copy(update={"stretch_factor": stretch_factor})
+    del song_b_bpm
+    target_bpm = float(song_a_bpm)
+    stretch_factor = tempo_aware_stretch_rate(song_a_bpm, target_bpm)
+    return arrangement.model_copy(
+        update={
+            "stretch_factor": stretch_factor,
+            "instrumental_source": "song_a",
+            "target_bpm": target_bpm,
+        }
+    )
+
+
+def _strip_other_under_vocals(
+    vocal_source: VocalPick,
+    overlay_stems: list[OverlayStem],
+    overlay_from: OverlayFrom,
+) -> tuple[list[OverlayStem], OverlayFrom]:
+    stems = list(overlay_stems)
+    if vocal_source != "none":
+        stems = [s for s in stems if s != "other"]
+    if overlay_from != "song_b" or not stems:
+        return [], "none"
+    return stems, "song_b"
 
 
 def arrangement_to_mashup_blueprint(
@@ -296,21 +405,71 @@ def arrangement_to_mashup_blueprint(
     *,
     allow_harmony: bool = False,
 ) -> MashupBlueprint:
-    """Convert bar-snapped StemActions into section-index timeline for the mixer."""
-    instr_sections = (
-        sections_a if arrangement.instrumental_source == "song_a" else sections_b
-    )
+    """Convert section-index StemActions into mixer timeline; inject A bookends."""
+    n_a = max(len(sections_a), 1)
+    n_b = max(len(sections_b), 1)
+    last_a = n_a - 1
+    actions = list(arrangement.actions)
+
+    # Inject Song A intro / outro bookends when missing.
+    if actions:
+        first = actions[0]
+        if first.section_start != 0 or first.vocal_source == "song_b":
+            actions.insert(
+                0,
+                StemAction(
+                    section_start=0,
+                    section_end=1,
+                    vocal_source="song_a",
+                    instrumental_source="song_a",
+                    section_name="A intro bookend",
+                ),
+            )
+        last = actions[-1]
+        if last.section_end < n_a or last.section_start > last_a or last.vocal_source == "song_b":
+            # Append outro if last action doesn't cover / use A outro.
+            covers_outro = last.section_start <= last_a < last.section_end
+            if not covers_outro or last.vocal_source == "song_b":
+                actions.append(
+                    StemAction(
+                        section_start=last_a,
+                        section_end=n_a,
+                        vocal_source="song_a",
+                        instrumental_source="song_a",
+                        section_name="A outro bookend",
+                    )
+                )
+
     timeline: list[ArrangementSegment] = []
-    for action in arrangement.actions:
-        instr_idx = section_index_for_bar(instr_sections, action.bar_start)
+    for action in actions:
+        instr_idx = int(action.section_start) % n_a
+        # Prefer the first index in the action range; clamp end exclusivity.
+        if action.section_end > action.section_start + 1:
+            # Multi-section blocks still pick the start section for the clip.
+            instr_idx = max(0, min(n_a - 1, action.section_start))
+
         if action.vocal_source == "song_a":
-            v_idx = section_index_for_bar(sections_a, action.bar_start)
+            v_idx = instr_idx % n_a
         elif action.vocal_source == "song_b":
-            v_idx = section_index_for_bar(sections_b, action.bar_start)
+            v_idx = instr_idx % n_b
+            instr_sec = pick_safe(sections_a, instr_idx)
+            if instr_sec is not None and sections_b:
+                match = next(
+                    (s for s in sections_b if s.label == instr_sec.label),
+                    None,
+                )
+                if match is not None:
+                    v_idx = match.index
         else:
             v_idx = 0
+
+        stems, overlay_from = _strip_other_under_vocals(
+            action.vocal_source,
+            list(action.overlay_stems),
+            action.overlay_from,
+        )
         name = action.section_name or (
-            f"{action.vocal_source} bars {action.bar_start}-{action.bar_end}"
+            f"{action.vocal_source} sections {action.section_start}-{action.section_end}"
         )
         timeline.append(
             ArrangementSegment(
@@ -321,6 +480,9 @@ def arrangement_to_mashup_blueprint(
                 harmony=False,
                 vocal_volume_db=action.vocal_volume_db,
                 high_pass_filter=action.high_pass_filter,
+                overlay_stems=stems,
+                overlay_from=overlay_from,
+                overlay_volume_db=action.overlay_volume_db,
             )
         )
     policy = arrangement.phrase_vocal_policy
@@ -328,14 +490,21 @@ def arrangement_to_mashup_blueprint(
         policy = "alternate"
     return MashupBlueprint(
         arranging_reasoning=arrangement.arrangement_reasoning,
-        instrumental_source=arrangement.instrumental_source,
+        instrumental_source="song_a",
         vocal_source=arrangement.vocal_source,
         target_bpm=arrangement.target_bpm,
         stretch_factor=arrangement.stretch_factor,
         phrase_vocal_policy=policy,
         timeline=timeline,
-        actions=list(arrangement.actions),
+        actions=list(actions),
+        song_b_hooks=arrangement.song_b_hooks,
     )
+
+
+def pick_safe(sections: list[Section], index: int) -> Section | None:
+    if not sections:
+        return None
+    return sections[int(index) % len(sections)]
 
 
 def _clamp_blueprint_indices(
@@ -345,10 +514,10 @@ def _clamp_blueprint_indices(
     *,
     allow_harmony: bool = False,
 ) -> MashupBlueprint:
-    """Clamp section indices into available maps; strip harmony unless allowed."""
+    """Clamp section indices into available maps; strip harmony / other under leads."""
     n_a = max(len(sections_a), 1)
     n_b = max(len(sections_b), 1)
-    instr_n = n_a if blueprint.instrumental_source == "song_a" else n_b
+    instr_n = n_a  # Song A anchor
     fixed: list[ArrangementSegment] = []
     for seg in blueprint.timeline:
         if seg.vocal_source == "song_a":
@@ -359,16 +528,25 @@ def _clamp_blueprint_indices(
             v_idx = 0
         i_idx = int(seg.instrumental_section_index) % instr_n
         harmony = bool(seg.harmony) and allow_harmony
+        stems, overlay_from = _strip_other_under_vocals(
+            seg.vocal_source,
+            list(seg.overlay_stems),
+            seg.overlay_from,
+        )
         fixed.append(
             seg.model_copy(
                 update={
                     "vocal_section_index": v_idx,
                     "instrumental_section_index": i_idx,
                     "harmony": harmony,
+                    "overlay_from": overlay_from,
+                    "overlay_stems": stems,
                 }
             )
         )
-    return blueprint.model_copy(update={"timeline": fixed})
+    return blueprint.model_copy(
+        update={"timeline": fixed, "instrumental_source": "song_a"}
+    )
 
 
 def _sections_prompt_block(name: str, sections: list[Section]) -> str:
@@ -400,14 +578,18 @@ def _arrangement_user_prompt(
     title_b: str | None = None,
 ) -> str:
     return (
-        f"Song A title: {title_a or 'Song A'}\n"
-        f"Song B title: {title_b or 'Song B'}\n"
+        f"Song A title (ANCHOR): {title_a or 'Song A'}\n"
+        f"Song B title (overlays + guest vocals): {title_b or 'Song B'}\n"
         f"Song A BPM: {song_a_bpm:.3f}\n"
         f"Song B BPM: {song_b_bpm:.3f}\n"
         f"creative_mode: {creative_mode}\n"
+        "Song A is the fixed instrumental bed. "
+        "Describe song_b_hooks first, then StemActions on Song A's SECTION indices "
+        "(section_start inclusive, section_end exclusive). "
+        "First action = A intro (index 0); last action = A outro (final index).\n"
         f"{_sections_prompt_block('Song A', sections_a)}\n"
         f"{_sections_prompt_block('Song B', sections_b)}\n"
-        "Return an ArrangementBlueprint with StemAction bars snapped to multiples of 8."
+        "Return an ArrangementBlueprint with instrumental_source=song_a."
     )
 
 
@@ -429,123 +611,145 @@ def _fallback_arrangement(
     *,
     creative_mode: str = "forced_match",
 ) -> ArrangementBlueprint:
-    """Role-aware StemAction fallback: verse A, chorus A, chorus B, optional buildup mute."""
+    """
+    Anchor-A fallback arc on section indices:
+    A intro → optional buildup mute → B middle (drums overlay) → A chorus → A outro.
+    """
     del creative_mode
     decision = _fallback_decision(song_a_bpm, song_b_bpm)
-    instr = decision.instrumental_source
-    instr_sections = sections_a if instr == "song_a" else sections_b
+    instr_sections = sections_a
     a_high = _high_indices(sections_a)
-    b_high = _high_indices(sections_b)
-    i_high = _high_indices(instr_sections)
-
-    def _bars(section: Section) -> tuple[int, int]:
-        return section.bar_start, section.bar_end
+    hooks = SongBHookPlan(
+        interesting_elements="percussion / drums from Song B",
+        preferred_overlay_stems=["drums"],
+        avoid="replacing Song A bed wholesale; other under leads",
+    )
 
     actions: list[StemAction] = []
-    # Intro / verse from A over early instrumental; mute if buildup.
-    if sections_a and instr_sections:
-        low_a = next(
-            (
-                s
-                for s in sections_a
-                if s.label in ("intro", "verse", "low", "buildup")
-            ),
-            sections_a[0],
-        )
-        early_i = instr_sections[0]
-        b0, b1 = _bars(early_i)
-        vocal: VocalPick = "none" if low_a.label == "buildup" else "song_a"
+    used_instr: set[int] = set()
+    n_a = len(instr_sections)
+    last_idx = max(n_a - 1, 0)
+
+    def _next_instr(prefer: Section | None = None) -> Section | None:
+        if prefer is not None and prefer.index not in used_instr:
+            return prefer
+        for s in instr_sections:
+            if s.index not in used_instr:
+                return s
+        return None
+
+    # Always open on A intro (section 0).
+    early = instr_sections[0] if instr_sections else None
+    if early is not None:
+        used_instr.add(early.index)
         actions.append(
             StemAction(
-                bar_start=b0,
-                bar_end=b1,
-                vocal_source=vocal,
-                instrumental_source=instr,
-                section_name="Intro / verse (A)",
-            )
-        )
-
-    # Prefer instrumental-only on buildup bars (director anti-collision / tension).
-    buildup = next((s for s in instr_sections if s.label == "buildup"), None)
-    if buildup:
-        b0, b1 = _bars(buildup)
-        if not actions or (b0, b1) != (actions[-1].bar_start, actions[-1].bar_end):
-            actions.append(
-                StemAction(
-                    bar_start=b0,
-                    bar_end=b1,
-                    vocal_source="none",
-                    instrumental_source=instr,
-                    section_name="Buildup (instrumental)",
-                )
-            )
-
-    a_sec = sections_a[a_high[0]] if sections_a else None
-    i_sec = instr_sections[i_high[0]] if instr_sections else None
-    if a_sec and i_sec:
-        b0, b1 = _bars(i_sec)
-        actions.append(
-            StemAction(
-                bar_start=b0,
-                bar_end=b1,
+                section_start=early.index,
+                section_end=early.index + 1,
                 vocal_source="song_a",
-                instrumental_source=instr,
-                section_name="Chorus/Drop A",
+                instrumental_source="song_a",
+                section_name="A intro over A bed",
             )
         )
 
-    b_sec = sections_b[b_high[0]] if sections_b else None
-    i_sec2 = instr_sections[i_high[min(1, len(i_high) - 1)]] if instr_sections else i_sec
-    if b_sec and i_sec2:
-        b0, b1 = _bars(i_sec2)
-        # Avoid identical bar range as previous action.
-        if not actions or (b0, b1) != (actions[-1].bar_start, actions[-1].bar_end):
-            actions.append(
-                StemAction(
-                    bar_start=b0,
-                    bar_end=b1,
-                    vocal_source="song_b",
-                    instrumental_source=instr,
-                    section_name="Chorus/Drop B",
-                )
+    buildup = next((s for s in instr_sections if s.label == "buildup"), None)
+    buildup = _next_instr(buildup)
+    if buildup is not None and buildup.label == "buildup" and buildup.index != last_idx:
+        used_instr.add(buildup.index)
+        actions.append(
+            StemAction(
+                section_start=buildup.index,
+                section_end=buildup.index + 1,
+                vocal_source="none",
+                instrumental_source="song_a",
+                section_name="Buildup (A instrumental)",
             )
-        else:
-            # Shift to next instrumental section if available.
-            alt = instr_sections[min(i_sec2.index + 1, len(instr_sections) - 1)]
-            b0, b1 = _bars(alt)
+        )
+
+    a_for_b_verse = _next_instr()
+    if (
+        a_for_b_verse is not None
+        and sections_b
+        and a_for_b_verse.index != last_idx
+    ):
+        used_instr.add(a_for_b_verse.index)
+        actions.append(
+            StemAction(
+                section_start=a_for_b_verse.index,
+                section_end=a_for_b_verse.index + 1,
+                vocal_source="song_b",
+                instrumental_source="song_a",
+                overlay_from="song_b",
+                overlay_stems=["drums"],
+                overlay_volume_db=-6.0,
+                section_name="B verse + drums over A bed",
+            )
+        )
+
+    high_pref = instr_sections[a_high[0]] if sections_a and a_high else None
+    high_a = next(
+        (
+            s
+            for s in instr_sections
+            if is_high_energy_label(s.label)
+            and s.index not in used_instr
+            and s.index != last_idx
+        ),
+        _next_instr(high_pref) if high_pref and high_pref.index != last_idx else None,
+    )
+    if high_a is not None and high_a.index != last_idx:
+        used_instr.add(high_a.index)
+        actions.append(
+            StemAction(
+                section_start=high_a.index,
+                section_end=high_a.index + 1,
+                vocal_source="song_a",
+                instrumental_source="song_a",
+                section_name="A chorus/drop over A bed",
+            )
+        )
+
+    # Always close on A outro.
+    if n_a > 0:
+        if last_idx not in used_instr or (
+            not actions or actions[-1].section_start != last_idx
+        ):
+            used_instr.add(last_idx)
             actions.append(
                 StemAction(
-                    bar_start=b0,
-                    bar_end=b1,
-                    vocal_source="song_b",
-                    instrumental_source=instr,
-                    section_name="Chorus/Drop B",
+                    section_start=last_idx,
+                    section_end=last_idx + 1,
+                    vocal_source="song_a",
+                    instrumental_source="song_a",
+                    section_name="A outro over A bed",
                 )
             )
 
     if not actions:
         actions.append(
             StemAction(
-                bar_start=0,
-                bar_end=8,
+                section_start=0,
+                section_end=1,
                 vocal_source="song_a",
-                instrumental_source=instr,
-                section_name="Fallback block",
+                instrumental_source="song_a",
+                section_name="Fallback A block",
             )
         )
 
     return ArrangementBlueprint(
         arrangement_reasoning=(
-            "Fallback director: verse/intro (or mute on buildup), then A chorus/drop, "
-            "then B chorus/drop over the instrumental bed — never dual lead vocals."
+            "Fallback anchor director: Song A bed throughout — A intro, optional "
+            "buildup mute, B middle with drums overlay, A chorus, A outro bookend."
         ),
-        instrumental_source=decision.instrumental_source,
-        vocal_source=decision.vocal_source,
+        song_b_hooks=hooks,
+        instrumental_source="song_a",
+        vocal_source="song_a",
         target_bpm=decision.target_bpm,
         stretch_factor=decision.stretch_factor,
         phrase_vocal_policy="alternate",
         actions=actions,
     )
+
 
 
 def _fallback_blueprint(

@@ -1,16 +1,53 @@
 # AI Song Mashup POC
 
-An overnight proof-of-concept that takes **two songs**, separates them into stems with **local Demucs**, uses an **LLM** to pick a mixing strategy, **time-stretches** the vocals to match BPM, and returns a mixed **MP3 mashup**.
+Local mashup app: upload **Song A** + **Song B**, separate stems with **Demucs**, read real section timestamps with **allin1**, let an **LLM** plan the creative arc (not the clocks), then mix with **librosa / pydub** into an MP3.
 
 Includes:
 
-- A **FastAPI** backend (`POST /api/mashup`)
-- A simple **drag-and-drop web UI** at `/`
-- Fully **local stem separation** (no Replicate / paid separation API)
+- **FastAPI** backend (`POST /api/mashup`)
+- Drag-and-drop **web UI** (+ in-page player) at `/`
+- Fully **local** stem separation and structure analysis (no paid separation API)
 
 ---
 
-## How it works
+## Architecture
+
+```text
+┌─────────────┐     ┌──────────────┐     ┌─────────────────┐
+│  static UI  │────▶│   main.py    │────▶│ session / MP3   │
+│  (app.js)   │◀────│  FastAPI     │◀────│ metadata.json   │
+└─────────────┘     └──────┬───────┘     └─────────────────┘
+                           │
+         ┌─────────────────┼─────────────────┐
+         ▼                 ▼                 ▼
+   demucs.py      allin1_structure.py    agent.py
+   (stems)        (sections+BPM)         (arrangement LLM)
+         │                 │                 │
+         └────────┬────────┴────────┬────────┘
+                  ▼                 ▼
+            dual_mix.py ◀──── audio.py / structure.py
+            (A bed + B overlays, stretch, key, export)
+```
+
+### Who owns what
+
+| Concern | Owner | Notes |
+|---------|--------|--------|
+| Stem separation (vocals/drums/bass/other) | **Demucs** (`demucs.py`) | Local `htdemucs`; runs on originals |
+| Section boundaries + labels + BPM | **allin1** (`allin1_structure.py`) | Real audio timestamps; DSP fallback if allin1 fails |
+| Beats / downbeats (when available) | **allin1** | Stored in session metadata |
+| Creative arc (A/B vocals, overlays, hooks) | **LLM** (`agent.py`) | Gemini or OpenAI; never invents section clocks |
+| Song A intro / outro bookends | **agent.py** post-validate | Always forced |
+| Key meeting, pitch shift, time-stretch | **librosa** (+ optional rubberband) | allin1 does not do key/pitch |
+| Mashability / chroma / rhythm scores | **librosa** (`mashability.py`) | Used when ranking / scoring |
+| Vocal activity mute / anti-bleed | **vad.py** + mix rules | Hard mute inactive leads |
+| Final concatenate + MP3 | **pydub** + **ffmpeg** | Adaptive crossfades |
+
+Song A is the **instrumental bed**. Song B can contribute selective overlays (drums/bass) and vocals per the director timeline.
+
+---
+
+## How it works (pipeline)
 
 ```text
 Song A + Song B
@@ -21,65 +58,35 @@ Song A + Song B
 └─────────┬───────────┘
           ▼
 ┌─────────────────────┐
-│ 2. Demucs (local)   │  vocals + no_vocals for each song
+│ 2. Demucs (local)   │  full stems (vocals/drums/bass/other)
 └─────────┬───────────┘
           ▼
 ┌─────────────────────┐
-│ 3. Librosa BPM      │  estimate tempo for A and B
+│ 3. allin1 structure │  real intro/verse/chorus timestamps + BPM
+│    (librosa fallback)│
 └─────────┬───────────┘
           ▼
 ┌─────────────────────┐
-│ 4. LLM decision     │  Gemini or OpenAI → MashupDecision
+│ 4. LLM arrangement  │  Gemini/OpenAI creative arc (not timestamps)
 └─────────┬───────────┘
           ▼
 ┌─────────────────────┐
-│ 5. Time-stretch     │  align vocals to target BPM (librosa)
+│ 5. Key + stretch    │  librosa chroma / pitch / time-stretch
 └─────────┬───────────┘
           ▼
 ┌─────────────────────┐
-│ 6. Key match        │  chroma key detect + pitch_shift vocals
-└─────────┬───────────┘
-          ▼
-┌─────────────────────┐
-│ 7. Mix + export     │  pydub overlay → mashup.mp3
+│ 6. Mix + export     │  A bed + selective B overlays → mashup.mp3
 └─────────────────────┘
 ```
 
-### Pipeline details
+1. **Upload** — multipart `song_a` / `song_b` (mp3, wav, flac, m4a, …).
+2. **Stem separation** — `services/demucs.py` → full stems per song.
+3. **Structure + BPM** — `allin1` on each **original** (WAV via ffmpeg when needed). Prefer allin1 BPM; on failure → `detect_sections` and `structure_source: "dsp_fallback"`.
+4. **Arrangement** — `decide_arrangement` builds the timeline; A intro/outro bookends injected. Bassline mode uses `decide_mashup_strategy` instead.
+5. **DSP** — key meeting (`minimal_meeting_shifts`), pitch shift, time-stretch to target BPM.
+6. **Mix** — section clips, selective B overlays, adaptive crossfades → `mashup.mp3`.
 
-1. **Upload** — The API accepts two multipart files: `song_a` and `song_b` (mp3, wav, flac, m4a, etc.).
-2. **Stem separation** — `services/demucs.py` shells out to the Demucs CLI:
-
-   ```bash
-   demucs -n htdemucs --two-stems vocals --mp3 -o {output_dir} {input_audio}
-   ```
-
-   That produces:
-
-   ```text
-   {output_dir}/htdemucs/{song_name}/vocals.mp3
-   {output_dir}/htdemucs/{song_name}/no_vocals.mp3
-   ```
-
-   `--mp3` uses `lameenc` for export (avoids a known `torchaudio` / `torchcodec` WAV save issue on newer PyTorch stacks).
-
-3. **BPM detection** — `services/audio.py` uses `librosa.beat.beat_track` on each original upload.
-4. **Mixing strategy** — `services/agent.py` calls **Gemini or OpenAI** (see `LLM_PROVIDER`) with a Pydantic structured output (`MashupDecision`):
-
-   | Field | Meaning |
-   |-------|---------|
-   | `vocal_source` | `"song_a"` or `"song_b"` |
-   | `instrumental_source` | the other song |
-   | `target_bpm` | BPM to align to (usually the instrumental’s) |
-   | `stretch_factor` | `target_bpm / vocal_source_bpm` |
-
-   If the selected provider fails (or its API key is missing), a deterministic fallback is used: **A vocals + B instrumental**, stretched to B’s BPM.
-
-5. **Time-stretch** — Vocals are stretched with `librosa.effects.time_stretch` (skipped if the factor is ~1.0).
-6. **Key match** — Detect keys with chroma STFT profiles, then `pitch_shift` vocals toward the instrumental root.
-7. **Mix** — `pydub` overlays vocals on the instrumental and exports `mashup.mp3` (requires **ffmpeg**).
-
-Demucs runs in a worker thread via `asyncio.to_thread(...)` so the FastAPI event loop is not blocked during the long separation step.
+Heavy work runs in `asyncio.to_thread(...)` so the event loop stays responsive.
 
 ---
 
@@ -87,51 +94,111 @@ Demucs runs in a worker thread via `asyncio.to_thread(...)` so the FastAPI event
 
 ```text
 ai-mashup-poc/
-├── main.py                 # FastAPI app, UI mount, /api/mashup pipeline
-├── requirements.txt        # Python dependencies
-├── .env.example            # Env var template (no secrets)
-├── .gitignore
+├── main.py                  # FastAPI routes + mashup orchestration
+├── requirements.txt         # Pinned Python deps (see below)
+├── .env.example
+├── scripts/
+│   └── smoke_allin1.py      # Verify true allin1 path (not DSP fallback)
 ├── services/
-│   ├── demucs.py           # Local Demucs CLI stem separation
-│   ├── audio.py            # BPM, time-stretch, mix
-│   └── agent.py            # Gemini/OpenAI MashupDecision + fallback
-└── static/
-    ├── index.html          # Drag-and-drop UI
-    ├── styles.css
-    └── app.js              # Upload → progress → download
+│   ├── demucs.py            # Local Demucs CLI stem separation
+│   ├── allin1_structure.py  # allin1 → Section list + BPM/beats
+│   ├── form_analysis.py     # Thin re-export of allin1 resolver
+│   ├── structure.py         # Section model + DSP detect_sections
+│   ├── agent.py             # Arrangement LLM + A bookends
+│   ├── dual_mix.py          # Dual-vocal / bassline builders + metadata
+│   ├── audio.py             # BPM (librosa), stretch, key, pitch helpers
+│   ├── mashability.py       # Chroma / rhythm mashability scores
+│   ├── vad.py               # Vocal activity helpers
+│   └── library.py           # Optional local track library ranking
+└── static/                  # UI: upload, progress, player, download
 ```
 
 ---
 
-## Requirements
+## Dependencies
 
 ### System
 
-| Dependency | Why |
-|------------|-----|
+| Dependency | Role |
+|------------|------|
 | **Python 3.10+** (3.11 recommended) | Runtime |
-| **ffmpeg** | `pydub` MP3 decode/export |
-| Disk + RAM | Demucs downloads ~80MB model weights on first run; separation is CPU/GPU heavy |
-
-Install ffmpeg (macOS):
+| **ffmpeg** | Decode/export MP3; convert uploads to WAV for allin1 timing |
+| **cmake** + **ninja** | Compile `natten` on macOS |
+| **rubberband** (optional) | Higher-quality time-stretch via `pyrubberband` |
 
 ```bash
-brew install ffmpeg
+brew install ffmpeg cmake ninja
+brew install rubberband   # optional
 ```
 
-### API keys / LLM provider
+### Python packages (`requirements.txt`)
+
+| Package | Role in this project |
+|---------|----------------------|
+| **fastapi** / **uvicorn** | HTTP API, static UI, `/api/mashup` |
+| **python-multipart** | File uploads |
+| **torch** / **torchaudio** (`2.2.2`) | Backend for Demucs + allin1/NATTEN (pin required on Mac) |
+| **demucs** | Local source separation (vocals/drums/bass/other) |
+| **allin1** | Music structure: segments, BPM, beats, downbeats |
+| **natten** (`0.15.1`) | Neighborhood attention kernels required by allin1 |
+| **madmom** (GitHub install) | Audio frontend used inside allin1 |
+| **Cython** / **setuptools&lt;81** | Build madmom; keep `pkg_resources` available |
+| **librosa** / **numpy** / **scipy** / **soundfile** | BPM fallback, key, stretch, spectral features, I/O |
+| **pydub** | Clip mix, crossfades, MP3 export (needs ffmpeg) |
+| **pyloudnorm** | Loudness normalization helpers |
+| **pyrubberband** | Optional rubberband stretch wrapper |
+| **openai** / **google-genai** | Arrangement LLM providers |
+| **pydantic** | Structured LLM / blueprint schemas |
+| **python-dotenv** | Load `.env` |
+| **httpx** / **requests** | HTTP clients used by LLM SDKs / helpers |
+
+### What each major tool does *not* do
+
+| Tool | Does **not** |
+|------|----------------|
+| allin1 | Key detection, pitch shift, creative arrangement |
+| LLM | Invent section start/end timestamps (replaced by allin1) |
+| Demucs | Structure labels / BPM (allin1 may demix again internally for its own features) |
+| librosa | Primary structure when allin1 succeeds |
+
+### macOS allin1 install (order matters)
+
+Working Apple Silicon combo: **torch 2.2.2 + natten 0.15.1 + allin1 1.1.0**. Newer torch/`natten` 0.21 breaks allin1’s imports.
+
+```bash
+pip install -r requirements.txt
+
+pip install Cython "setuptools>=70,<81"
+pip install --no-build-isolation "git+https://github.com/CPJKU/madmom.git"
+
+pip install torch==2.2.2 torchaudio==2.2.2
+pip uninstall -y natten cmake    # drop broken pip cmake wheel if present
+pip install --no-build-isolation --no-cache-dir natten==0.15.1
+pip install allin1==1.1.0
+
+PYTHONPATH=. python scripts/smoke_allin1.py   # expect: source allin1
+```
+
+Notes:
+
+- Prefer **WAV** uploads (or let the app convert via ffmpeg) — MP3 decoder offsets can skew beats.
+- First allin1 run downloads Harmonix weights from Hugging Face (`HF_TOKEN` helps if rate-limited).
+- allin1 demixes into the job work dir; mix stems still come from our Demucs pass on the originals.
+- If analyze fails → DSP fallback; session metadata records `structure_source`.
+
+---
+
+## API keys / LLM provider
 
 | Variable | Required? | Purpose |
 |----------|-----------|---------|
 | `LLM_PROVIDER` | Optional | `gemini` (default) or `openai` |
-| `GEMINI_API_KEY` | If using Gemini | Google AI Studio / Gemini API key |
-| `GEMINI_MODEL` | Optional | Defaults to `gemini-flash-latest` |
-| `OPENAI_API_KEY` | If using OpenAI | OpenAI API key |
-| `OPENAI_MODEL` | Optional | Defaults to `gpt-4o-mini` |
+| `GEMINI_API_KEY` | If Gemini | Google AI Studio / Gemini API key |
+| `GEMINI_MODEL` | Optional | Default `gemini-flash-latest` |
+| `OPENAI_API_KEY` | If OpenAI | OpenAI API key |
+| `OPENAI_MODEL` | Optional | Default `gpt-4o-mini` |
 
-Stem separation is **local and free**. Without a working LLM key for the selected provider, the app still works using the A-vocals / B-instrumental fallback.
-
-Example `.env`:
+Stem separation and allin1 are **local**. Without a working LLM key, a deterministic A-anchor arrangement fallback is used.
 
 ```env
 LLM_PROVIDER=gemini
@@ -141,32 +208,26 @@ OPENAI_API_KEY=sk-your_openai_key_here
 OPENAI_MODEL=gpt-4o-mini
 ```
 
-Switch providers by changing `LLM_PROVIDER` and restarting uvicorn (or relying on `--reload` after env is loaded — restart is safer for env changes).
-
 ---
 
 ## Setup
 
 ```bash
-# 1. Clone
 git clone https://github.com/komeslik/ai-mashup-poc.git
 cd ai-mashup-poc
 
-# 2. Virtualenv
 python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 
-# 3. Install Python deps (pulls torch + demucs; can take a few minutes)
+brew install ffmpeg cmake ninja
 pip install -r requirements.txt
+# Then complete the macOS allin1 block above (madmom + natten rebuild).
 
-# 4. Env file
 cp .env.example .env
 # Edit .env — set LLM_PROVIDER and the matching API key
-#   LLM_PROVIDER=gemini  + GEMINI_API_KEY=...
-#   LLM_PROVIDER=openai  + OPENAI_API_KEY=...
 ```
 
-**Do not commit `.env`.** It is gitignored. Only `.env.example` (placeholders) belongs in the repo.
+**Do not commit `.env`.**
 
 ---
 
@@ -177,24 +238,16 @@ source .venv/bin/activate
 uvicorn main:app --reload --port 8000
 ```
 
-Then open:
-
 | URL | What |
 |-----|------|
-| http://127.0.0.1:8000/ | Web UI (drag-drop two tracks → Mashup → download) |
+| http://127.0.0.1:8000/ | Web UI |
 | http://127.0.0.1:8000/docs | Swagger / OpenAPI |
-| http://127.0.0.1:8000/health | Health check (`{"status":"ok"}`) |
+| http://127.0.0.1:8000/health | `{"status":"ok"}` |
 
-### Using the UI
-
-1. Drop **Song A** and **Song B** into the two zones (or click to browse).
+1. Drop **Song A** and **Song B**.
 2. Click **Mashup**.
-3. Wait — Demucs runs **twice** (once per song). On CPU this often takes several minutes; first ever run also downloads model weights.
-4. When finished, the progress bar hides and a **Download mashup.mp3** button appears.
-
-Progress text in the UI is approximate (the API is one long request). The elapsed timer is real.
-
-### Using curl
+3. Wait — Demucs ×2 plus allin1 (which demixes again). First run also downloads models.
+4. Play in-page or **Download mashup.mp3**.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/mashup \
@@ -202,13 +255,6 @@ curl -X POST http://127.0.0.1:8000/api/mashup \
   -F "song_b=@/path/to/song_b.mp3" \
   --output mashup.mp3
 ```
-
-### Using Swagger
-
-1. Open http://127.0.0.1:8000/docs  
-2. Expand `POST /api/mashup`  
-3. Upload two files and execute  
-4. Download the response body as an MP3  
 
 ---
 
@@ -226,42 +272,25 @@ curl -X POST http://127.0.0.1:8000/api/mashup \
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `song_a` | file | First track |
-| `song_b` | file | Second track |
+| `song_a` | file | Anchor track (instrumental bed) |
+| `song_b` | file | Guest track (vocals / overlays) |
 
-**Success:** `200` with `audio/mpeg` body (`mashup.mp3`).
-
-**Common errors:**
+**Success:** `200` `audio/mpeg` (`mashup.mp3`). Session metadata (sections, `structure_source`, blueprint) is written under the session dir for the UI.
 
 | Status | Meaning |
 |--------|---------|
 | `400` | Bad upload / BPM detection failure |
-| `500` | Demucs CLI failure, mix/ffmpeg failure, or unexpected error |
-| `502` | Upstream LLM failure that wasn’t covered by fallback (rare) |
-
----
-
-## Configuration
-
-Create `.env` from the example:
-
-```bash
-cp .env.example .env
-```
-
-```env
-OPENAI_API_KEY=sk-your_openai_key_here
-OPENAI_MODEL=gpt-4o-mini
-```
+| `500` | Demucs / mix / ffmpeg failure |
+| `502` | Strategy/arrangement failure |
 
 ---
 
 ## Performance notes
 
-- **First Demucs run** downloads the `htdemucs` checkpoint (~80MB) into Demucs’ cache.
-- **Each mashup** separates two full songs locally. Short clips are much faster for testing.
-- On Apple Silicon, PyTorch uses CPU/MPS depending on your torch build; expect multi-minute runs for full-length tracks.
-- Temporary work files live under `/tmp` and are cleaned up after the response (final MP3 is deleted via a background task after download).
+- First Demucs + allin1 runs download model weights (Demucs cache + Hugging Face Harmonix).
+- Each mashup: Demucs twice + allin1 twice (allin1’s own demix). Short clips are much faster for testing.
+- Torch pinned to **2.2.2** for allin1; expect multi-minute runs for full tracks on CPU/MPS.
+- Temp work under `/tmp`; final MP3 cleaned up after download via background task.
 
 ---
 
@@ -269,31 +298,22 @@ OPENAI_MODEL=gpt-4o-mini
 
 | Problem | Fix |
 |---------|-----|
-| `demucs CLI not found` | Activate `.venv` and reinstall: `pip install demucs` |
-| `ffmpeg` / MP3 export errors | `brew install ffmpeg` and ensure it’s on `PATH` |
-| OpenAI errors in logs | Check `OPENAI_API_KEY`; app should still mashup via fallback |
-| UI stuck / long wait | Normal during Demucs; watch the uvicorn terminal for `Separating stems…` logs |
-| Import / torchcodec WAV errors | This project uses Demucs `--mp3` to avoid that path |
-
----
-
-## Tech stack
-
-- **FastAPI** + **Uvicorn** — HTTP API and static UI
-- **Demucs 4** (`htdemucs`) — local music source separation
-- **Librosa** + **NumPy** + **SoundFile** — BPM and time-stretch
-- **pydub** + **ffmpeg** — mixing and MP3 export
-- **OpenAI** + **Pydantic** — structured mashup decision
-- **python-dotenv** — local config
+| `demucs CLI not found` | Activate `.venv`; `pip install demucs` |
+| `ffmpeg` / MP3 errors | `brew install ffmpeg` |
+| allin1 / NATTEN import errors | Keep `torch==2.2.2` + rebuild `natten==0.15.1` (see Dependencies) |
+| `natten` cmake / build errors | `brew install cmake ninja`; `pip uninstall -y cmake` |
+| `structure_source: dsp_fallback` | allin1 failed at runtime; check uvicorn logs; re-run smoke test |
+| LLM errors in logs | Check API keys; arrangement fallback still mashups |
+| Long UI wait | Expected (Demucs + allin1); watch terminal progress |
 
 ---
 
 ## Security / privacy
 
-- Secrets belong only in `.env` (gitignored).
-- Uploaded audio is processed locally for stem separation.
-- OpenAI receives **BPM numbers only** (not the audio files) when deciding strategy.
-- This is a **POC**: no auth, no job queue, no production hardening.
+- Secrets only in `.env` (gitignored).
+- Audio stays local for Demucs / allin1 / mix.
+- The arrangement LLM receives **structured role maps / section summaries** (labels, energies, indices, BPMs) — not raw audio files.
+- POC only: no auth, no job queue, no production hardening.
 
 ---
 
@@ -301,4 +321,4 @@ OPENAI_MODEL=gpt-4o-mini
 
 POC code is provided as-is for experimentation.
 
-Demucs is from Meta/FAIR research; respect Demucs’ and model license terms when redistributing or commercializing. Use only audio you have rights to mash up.
+Demucs (Meta/FAIR), allin1 / Harmonix models, and NATTEN have their own licenses — respect them when redistributing. Use only audio you have rights to mash up.

@@ -1,6 +1,9 @@
 fastapi==0.115.8
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
+# Pin torch for allin1/NATTEN on macOS (2.13+ breaks natten 0.15.1).
+torch==2.2.2
+torchaudio==2.2.2
 demucs==4.0.1
 librosa==0.10.2.post1
 numpy==1.26.4
@@ -15,3 +18,8 @@ requests==2.32.3
 pyloudnorm==0.1.1
 scipy==1.14.1
 pyrubberband==0.4.0
+# Structure analysis — install order matters (see README "allin1").
+Cython>=0.25
+setuptools>=70,<81
+allin1==1.1.0
+natten==0.15.1

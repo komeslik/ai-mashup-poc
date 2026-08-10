@@ -131,9 +131,13 @@ def find_best_mashability_alignment(
     weights: MashabilityWeights | None = None,
     window_beats: int = DEFAULT_WINDOW_BEATS,
     max_key_shift: int = DEFAULT_MAX_KEY_SHIFT,
+    fixed_n_steps: int | None = None,
 ) -> MashabilityAlignment:
     """
     Search beat offset + key rotation maximizing weighted mashability.
+
+    When *fixed_n_steps* is set, lock pitch rotation to that value (global key
+    meeting) and only search beat windows / rhythm / spectral fit.
 
     Rhythm uses 12 sub-beat onset histograms (straight vs swing sensitive).
     """
@@ -166,10 +170,13 @@ def find_best_mashability_alignment(
     duration_i = float(librosa.get_duration(y=y_i, sr=sr_i))
 
     if win < 2:
-        try:
-            n_steps = semitones_to_match_key(get_key(vocal_path), get_key(instrumental_path))
-        except ValueError:
-            n_steps = 0
+        if fixed_n_steps is not None:
+            n_steps = int(fixed_n_steps)
+        else:
+            try:
+                n_steps = semitones_to_match_key(get_key(vocal_path), get_key(instrumental_path))
+            except ValueError:
+                n_steps = 0
         end = min(duration_v, duration_i)
         return MashabilityAlignment(
             n_steps=n_steps,
@@ -183,9 +190,19 @@ def find_best_mashability_alignment(
             instrumental_end_sec=end,
         )
 
-    key_shifts = list(range(-max_key_shift, max_key_shift + 1))
+    if fixed_n_steps is not None:
+        key_shifts = [int(fixed_n_steps)]
+    else:
+        key_shifts = list(range(-max_key_shift, max_key_shift + 1))
     best_score = -np.inf
-    best: tuple[int, int, int, float, float, float] = (0, 0, 0, 0.0, 0.0, 0.0)
+    best: tuple[int, int, int, float, float, float] = (
+        key_shifts[0],
+        0,
+        0,
+        0.0,
+        0.0,
+        0.0,
+    )
 
     vocal_step = 1 if n_v - win < 48 else max(1, (n_v - win) // 24)
     instr_step = 1 if n_i - win < 64 else max(1, (n_i - win) // 32)

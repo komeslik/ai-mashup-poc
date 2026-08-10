@@ -26,6 +26,8 @@ htmlcov/
 # Demucs / ML artifacts
 separated/
 models/
+demix/
+spec/
 *.pth
 *.th
 
