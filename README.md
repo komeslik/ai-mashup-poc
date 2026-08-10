@@ -1,5 +1,9 @@
 # AI Song Mashup POC
 
+<img width="753" height="664" alt="Screenshot 2026-08-10 at 3 41 01 AM" src="https://github.com/user-attachments/assets/4814f631-0bd4-4dac-87f5-1ff132a6e6ed" />
+<img width="711" height="664" alt="Screenshot 2026-08-10 at 7 25 25 AM" src="https://github.com/user-attachments/assets/587e95b6-e510-45b6-9f87-4c66ec564825" />
+
+
 Local mashup app: upload **Song A** + **Song B**, separate stems with **Demucs**, choose **structure mode** (allin1 / LLM / DSP), let an **LLM** plan the creative arc, mix with **librosa / pydub**, then edit in a beginner **Section editor** grid.
 
 Includes:
