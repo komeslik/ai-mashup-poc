@@ -1,18 +1,18 @@
 ---
 name: AutoMashUpper Improvements
-overview: First fix LLM strategy with an OpenAI/Gemini feature flag, then map AutoMashUpper mashability ideas onto the POC in phased DSP upgrades.
+overview: "After Gemini/OpenAI (done), upgrade DSP for beat/phrase mashability and dual-vocal mashups so both singers appear via phrase-aware scheduling—not a single global vocal pick."
 todos:
   - id: phase0-llm-provider-flag
-    content: "Phase 0: LLM_PROVIDER flag (openai|gemini), Gemini structured MashupDecision, env/.env.example/README — do before AutoMashUpper DSP"
+    content: "Phase 0: LLM_PROVIDER flag (openai|gemini) — DONE"
     status: completed
   - id: phase1-beats-local-chroma
-    content: "Phase 1: beat grid, tempo-octave, local chroma match + loudness-normalized mix in audio.py/main.py"
+    content: "Phase 1: beat grid, tempo-octave, local chroma match + loudness-normalized mix (still single-vocal path)"
     status: pending
-  - id: phase2-phrases
-    content: "Phase 2: phrase segmentation + per-section best-window mashup stitching"
+  - id: phase2-phrases-dual-vocals
+    content: "Phase 2: phrase segmentation on both songs + schedule BOTH vocal stems into the mashup (alternate/call-response; optional short harmony overlays)"
     status: pending
   - id: phase3-mashability-ui
-    content: "Phase 3: harmonic/rhythmic/spectral mashability weights + UI/API controls"
+    content: "Phase 3: harmonic/rhythmic/spectral mashability weights + UI/API controls for dual-vocal policy"
     status: pending
   - id: phase4-optional
     content: "Phase 4 (later): library search, rubberband/tuning cents, section editor"
@@ -22,151 +22,121 @@ isProject: false
 
 # Improve Mashup POC from AutoMashUpper
 
-## Phase 0 — LLM provider switch (do this first)
+## Dual-vocals clarification (your listening test)
 
-OpenAI mashup decisions are failing and falling back. Before AutoMashUpper DSP work, make the strategy agent provider-pluggable.
+**Not chance — coded that way.** Today the pipeline deliberately picks **one** vocal stem and **one** instrumental stem:
 
-### Design
+- Demucs separates both songs into `vocals` + `no_vocals`
+- [`MashupDecision`](services/agent.py) chooses `vocal_source` ∈ {song_a, song_b} and `instrumental_source` as the other
+- [`_select_stems`](main.py) returns a **single** `vocal_path` + `instrumental_path`
+- Mix overlays only that one vocal onto that instrumental
 
-- Env flag: `LLM_PROVIDER=openai|gemini` (default `gemini` once Gemini is configured, or `openai` if only OpenAI key exists — **default to `gemini`** when implementing, since that is the requested fix path).
-- Keep the same Pydantic model `MashupDecision` and public API `decide_mashup_strategy(song_a_bpm, song_b_bpm)`.
-- Implement two backends in [services/agent.py](services/agent.py) (or split `services/llm_openai.py` / `services/llm_gemini.py` if cleaner):
-  - **openai**: existing `client.beta.chat.completions.parse` path
-  - **gemini**: Google GenAI structured output (JSON schema / response schema matching `MashupDecision`)
-- On missing key or API failure for the selected provider: keep deterministic A-vocals / B-instrumental fallback; log which provider failed.
-- Never commit real keys. User must put secrets only in local `.env` (gitignored).
+So you only hear one singer because the product rule is “a cappella from A over bed from B” (or the reverse), not a duet.
 
-### Env / deps
+### Is the old plan enough for both vocals?
 
-Update [.env.example](.env.example):
+**No.** Phase 1 (beats / local chroma / loudness) improves alignment quality for the **current single-vocal** mix. It does **not** by itself put both singers in the output.
 
-```env
-LLM_PROVIDER=gemini
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4o-mini
-GEMINI_API_KEY=
-GEMINI_MODEL=gemini-2.0-flash
+**Phrase detection is necessary** (and with scheduling, sufficient) for a good dual-vocal mashup:
+
+- Blindly stacking both full vocal stems for the whole song usually sounds muddy (AutoMashUpper listening tests also found overlapping vocals often hurt enjoyment).
+- Phrase/section structure lets us **feature both singers over time**: e.g. A sings verse regions, B sings chorus regions, or call-and-response on alternating phrases, with optional short harmony stacks only where harmonic mashability is high.
+
+Target product rule going forward: **both vocal stems must appear in the final mashup**, primarily via **phrase-aware assignment**, not “always both at once for the full duration.”
+
+```mermaid
+flowchart TB
+  subgraph today [Current coded behavior]
+    T1[Demucs A and B] --> T2[LLM picks one vocal + other instrumental]
+    T2 --> T3[Single vocal overlay]
+  end
+  subgraph dual [Planned dual-vocal behavior]
+    D1[Demucs A and B] --> D2[Phrase segments on both]
+    D2 --> D3[Pick base instrumental]
+    D3 --> D4[Per phrase assign vocal A and/or B]
+    D4 --> D5[Beat-match + key + loudness per clip]
+    D5 --> D6[Stitch mashup with both singers]
+  end
+  today --> dual
 ```
 
-- Add `google-genai` (or current official Gemini Python SDK) to [requirements.txt](requirements.txt).
-- Document the flag in [README.md](README.md).
+---
 
-### Security note
+## Phase 0 — LLM provider switch (DONE)
 
-A Gemini API key was pasted in chat. **Do not write that key into the plan, README, or git.** Rotate/revoke it in Google AI Studio if it may have been exposed, then set the new value only in local `.env` as `GEMINI_API_KEY=...`.
-
-### Files
-
-| File | Change |
-|------|--------|
-| [services/agent.py](services/agent.py) | Provider dispatch + Gemini structured call |
-| [.env.example](.env.example) | `LLM_PROVIDER`, `GEMINI_API_KEY`, `GEMINI_MODEL` |
-| [requirements.txt](requirements.txt) | Gemini SDK |
-| [README.md](README.md) | How to switch providers |
+Gemini/OpenAI feature flag is implemented. Keep using `LLM_PROVIDER=gemini` locally.
 
 ---
 
 ## What the paper does (vs what we do now)
 
-AutoMashUpper (Davies et al., 2014) does **not** primarily do vocal-over-instrumental stem mashups. It:
+AutoMashUpper (Davies et al., 2014):
 
-1. Segments an **input song into phrase sections** (downbeat-aligned, typically 2/4/8 bars)
-2. Scores **mashability** of each section against candidate material using:
-   - **Harmonic** similarity (beat-sync chromagram cross-correlation over key transpositions)
-   - **Rhythmic** similarity (kick/snare onset patterns at 12ths-of-a-beat)
-   - **Spectral balance** (low/mid/high loudness complementarity)
-   - Optional **tempo-range** reward (+ tempo-octave handling)
-3. Picks the best **local window** in a candidate (not whole-song average)
-4. Aligns with **beat-matched time-stretch**, **pitch shift + tuning**, and **loudness matching**
-5. Can stitch **different songs per section** into one multi-song mashup
+1. Segments into **phrase sections**
+2. Scores **mashability** (harmonic + rhythmic + spectral balance)
+3. Finds **local** best windows under key/tempo transforms
+4. Aligns with beat-matched stretch, pitch shift, loudness match
+5. Can stitch **different material per section**
 
-Our POC today ([main.py](main.py), [services/audio.py](services/audio.py)):
+Our POC today: full-track Demucs → **one** vocal + **one** instrumental → global BPM/key → overlay.
 
-- Full-track Demucs → one vocals stem + one instrumental stem
-- LLM chooses which song supplies which stem
-- **Global** BPM stretch + **global** root key shift
-- Naive `pydub` overlay (no beat grid, no sections, no mashability score)
+Paper caution about overlapping vocals still applies as a **mixing constraint**, not as “only one singer allowed.” We use phrases to avoid constant collision while still using both singers.
 
-Important insight from the paper’s listening test: **overlapping vocals** hurt enjoyment correlation. Our Demucs “one vocal + one instrumental” design already avoids that better than full-song layering—keep it.
+---
 
-```mermaid
-flowchart TB
-  subgraph today [Current POC]
-    A1[Two full songs] --> A2[Demucs stems]
-    A2 --> A3[Global BPM + key]
-    A3 --> A4[Overlay mix]
-  end
-  subgraph target [Paper-inspired target]
-    B1[Two songs + Demucs] --> B2[Beats + phrases]
-    B2 --> B3[Local mashability search]
-    B3 --> B4[Beat-match + pitch + loudness]
-    B4 --> B5[Section-stitched mashup]
-  end
-  today --> target
-```
+## Recommended improvement phases
 
-## Recommended improvement phases (after Phase 0)
+### Phase 1 — Forced 2-song quality (single-vocal path first)
 
-### Phase 1 — Forced 2-song quality (highest ROI, keep current API)
+Keep current API shape; deepen DSP in [services/audio.py](services/audio.py) so later dual-vocal clips align cleanly.
 
-Stay on `POST /api/mashup` with two uploads; deepen DSP in [services/audio.py](services/audio.py) (+ small helpers).
+1. Beat tracking + beat-matched stretch (tempo-octave aware)
+2. Local harmonic mashability (beat-sync chroma × key rotations → best offset + `n_steps`)
+3. Loudness match before overlay
+4. Trim/loop to matched section length
 
-1. **Beat tracking** (librosa `beat_track` → beat times for each stem/song).
-2. **Beat-matched stretch** instead of a single constant `stretch_factor`:
-   - Map candidate beat times onto target beat grid (paper uses Rubber Band; we can approximate with piecewise stretch or add `pyrubberband` if ffmpeg/rubberband is available).
-3. **Local harmonic mashability** (paper’s core novelty):
-   - Beat-sync chromagrams via `librosa.feature.chroma_stft` / `chroma_cqt`
-   - Cross-correlate a vocal (or input) chroma patch against the instrumental track across **beat offsets** and **12 key rotations**
-   - Choose best window + best `n_steps` (replace today’s whole-song `get_key` / root-only match)
-4. **Tempo octave handling**: if BPMs are near 2×, prefer half/double beat grid over extreme stretch (paper §III intro).
-5. **Loudness match**: ReplayGain-style or RMS/LUFS normalization before overlay so one stem doesn’t bury the other (paper §III-E).
-6. **Trim/loop to matched section length** so we don’t always dump full mismatched song lengths on top of each other.
+Still single-vocal for this phase — foundation for Phase 2.
 
-LLM role can shrink to “which stem is vocal vs instrumental” (or stay as-is); **alignment should be signal-driven**, not LLM-driven.
+### Phase 2 — Phrase segmentation + dual-vocal scheduling (required for both singers)
 
-### Phase 2 — Phrase-section mashups (paper’s multi-region idea)
+New module e.g. [services/structure.py](services/structure.py); update [main.py](main.py) mix path and [services/agent.py](services/agent.py) decision model.
 
-Add phrase segmentation on the **instrumental** (or “base”) track:
+1. **Phrase-segment both songs** (downbeat-aware Foote novelty / librosa recurrence or bar-grid regularity of 2/4/8 bars).
+2. Choose a **base instrumental** (LLM or heuristic: usually the denser / more compatible bed; can still be song A or B `no_vocals`).
+3. **Dual-vocal schedule** over base phrases (default policy):
+   - **Primary:** alternate / call-response — each phrase features vocal A **or** vocal B (both appear across the song).
+   - **Secondary:** where mashability is high, allow a **short harmony overlay** of the other vocal (limited bars, ducked level), not full-duration double-lead.
+4. For each scheduled vocal clip: time-stretch to phrase tempo grid, pitch-shift to instrumental key (local chroma), loudness-normalize, then overlay onto that phrase of the instrumental.
+5. Stitch phrases into final `mashup.mp3`.
+6. Expand `MashupDecision` (or add `DualVocalPlan`) so the LLM can propose:
+   - `instrumental_source`
+   - `phrase_vocal_policy`: `alternate` | `a_lead_b_harmony` | `b_lead_a_harmony`
+   - optional preference for which singer leads verses vs choruses if structure labels exist later
 
-- Foote-style novelty on a self-similarity matrix of beat-/downbeat-synchronous features (librosa already supports novelty/segmentation patterns; we can start simpler with agglomerative / recurrence segmentation).
-- For each phrase of the base track, find the best local window in the other song’s complementary stem.
-- Time-stretch/pitch-shift **per section**, then concatenate.
-- Optional: allow both songs to contribute different sections (true multi-song mashup) while still using Demucs to avoid dual-vocal collisions.
+Acceptance criterion: listening to one mashup, **both** song A and song B vocal identities are clearly audible in different sections (and optionally brief harmony moments).
 
-Touches: new `services/structure.py`, pipeline changes in [main.py](main.py), UI progress stages in [static/app.js](static/app.js).
+### Phase 3 — Mashability scoring + UI controls
 
-### Phase 3 — Explicit mashability scoring + UI controls
+- Weights: harmonic / rhythmic / spectral
+- Max key-shift / tempo deviation
+- Dual-vocal policy control in UI (`alternate` vs `allow_harmony`)
+- Return schedule metadata (which phrase used which vocal) for debugging
 
-Expose paper-style controls (even for 2-song forced mode):
+### Phase 4 — Optional later
 
-- Weights: harmonic / rhythmic / spectral (defaults harmonic-heavy, as in the paper)
-- Max key-shift range (e.g. ±6)
-- Max tempo deviation
-- Return mashability score + chosen section offsets in API JSON metadata (or response headers) for debugging
-- UI sliders on [static/index.html](static/index.html) mirroring AutoMashUpper’s center panel (simplified)
+- Library search, Rubber Band, cents tuning, interactive section editor
 
-Rhythmic feature: kick/snare-ish onset envelopes (HPSS + onset strength), subsampled 12× per beat, cosine similarity—ported lightly from paper §III-B.
-
-Spectral balance: 3-band beat-sync energy flatness (§III-C).
-
-### Phase 4 — Optional later expansions (lower priority)
-
-- Song **library / collection search** (paper’s main ranking use case)—out of scope for current 2-file API unless you add a corpus.
-- Fine **tuning correction** (cents) beyond integer semitones (NNLS-style tuning in paper).
-- Interactive section editor (swap/delete section matches)—large UI project.
-- Rubber Band for higher-quality stretch/pitch than librosa.
+---
 
 ## What not to copy blindly
 
-- Full MATLAB/Sonic Annotator NNLS chroma stack — recreate with librosa.
-- Multi-hundred song search — unnecessary until you have a library.
-- Mixing **two full mixes** with vocals overlapping — paper listeners disliked that; our stem approach is an improvement to keep.
-- Assuming constant 4/4 — document as a POC assumption (paper does too).
+- Always stacking both full vocals for the entire track
+- Ignoring phrase boundaries (Phase 1 alone will not fix “only one singer”)
+- Assuming 4/4 / constant tempo without documenting the POC assumption
 
 ## Implementation order
 
-1. **Phase 0** — Gemini/OpenAI feature flag (unblocks strategy without OpenAI)
-2. **Phase 1** — beats, local chroma, loudness (first AutoMashUpper DSP slice)
-3. Phases 2–4 as follow-ups
-
-Leave phrase stitching and weighted mashability UI for Phase 2–3 once Phase 1 sound quality is clearly better.
+1. Phase 0 — DONE (Gemini/OpenAI)
+2. Phase 1 — beat/chroma/loudness foundation
+3. **Phase 2 — phrases + dual-vocal schedule (answers your singer requirement)**
+4. Phase 3–4 — controls and polish
