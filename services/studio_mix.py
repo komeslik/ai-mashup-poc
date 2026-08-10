@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import shutil
 import uuid
 from pathlib import Path
@@ -167,7 +168,79 @@ def seed_studio_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "sections_b": sections_b,
         "crossfade_ms": int(metadata.get("crossfade_ms") or CROSSFADE_MS),
         "target_bpm": metadata.get("target_bpm"),
+        "beats_a": _beats_for_studio(metadata, "a"),
+        "beats_b": _beats_for_studio(metadata, "b"),
+        "downbeats_a": _downbeats_for_studio(metadata, "a"),
+        "downbeats_b": _downbeats_for_studio(metadata, "b"),
     }
+
+
+def _structure_blob(metadata: dict[str, Any], song: str) -> dict[str, Any]:
+    key = f"structure_{song}"
+    blob = metadata.get(key)
+    return blob if isinstance(blob, dict) else {}
+
+
+def _tempo_scale(metadata: dict[str, Any], song: str) -> float:
+    """Map original-time → stretched-stem time (1/rate), matching dual_mix stretch."""
+    struct = _structure_blob(metadata, song)
+    source_bpm = float(struct.get("bpm") or struct.get("measured_bpm") or 0.0)
+    target = float(metadata.get("target_bpm") or source_bpm or 0.0)
+    if source_bpm <= 0 or target <= 0:
+        return 1.0
+    # Prefer tempo-octave candidates closest to 1.0 (same as tempo_aware_stretch_rate).
+    candidates = (
+        target / source_bpm,
+        (target / 2.0) / source_bpm,
+        (target * 2.0) / source_bpm,
+    )
+    rate = float(min(candidates, key=lambda r: abs(math.log2(r))))
+    if rate <= 0:
+        return 1.0
+    return 1.0 / rate
+
+
+def _scaled_times(times: list[Any], scale: float) -> list[float]:
+    out: list[float] = []
+    for t in times or []:
+        try:
+            out.append(float(t) * scale)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _beats_for_studio(metadata: dict[str, Any], song: str) -> list[float]:
+    struct = _structure_blob(metadata, song)
+    scale = _tempo_scale(metadata, song)
+    beats = _scaled_times(list(struct.get("beats") or []), scale)
+    if beats:
+        return beats
+    # Fallback: synthetic grid from BPM on stretched timeline.
+    bpm = float(struct.get("bpm") or metadata.get("target_bpm") or 0.0)
+    if bpm <= 0:
+        return []
+    dur = 0.0
+    for sec in metadata.get(f"sections_{song}") or []:
+        try:
+            dur = max(dur, float(sec.get("end_sec") or 0.0) * scale)
+        except (TypeError, ValueError):
+            continue
+    if dur <= 0:
+        dur = 180.0
+    step = 60.0 / bpm
+    t = 0.0
+    out: list[float] = []
+    while t <= dur + 1e-6:
+        out.append(round(t, 4))
+        t += step
+    return out
+
+
+def _downbeats_for_studio(metadata: dict[str, Any], song: str) -> list[float]:
+    struct = _structure_blob(metadata, song)
+    scale = _tempo_scale(metadata, song)
+    return _scaled_times(list(struct.get("downbeats") or []), scale)
 
 
 def load_studio(session_dir: Path) -> dict[str, Any]:
@@ -176,6 +249,17 @@ def load_studio(session_dir: Path) -> dict[str, Any]:
         studio = json.loads(path.read_text(encoding="utf-8"))
         studio["sections_a"] = enrich_sections_display(list(studio.get("sections_a") or []))
         studio["sections_b"] = enrich_sections_display(list(studio.get("sections_b") or []))
+        # Backfill beats for older sessions from metadata when missing.
+        if not studio.get("beats_a") or not studio.get("beats_b"):
+            meta_path = session_dir / "metadata.json"
+            if meta_path.is_file():
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+                if not studio.get("beats_a"):
+                    studio["beats_a"] = _beats_for_studio(metadata, "a")
+                    studio["downbeats_a"] = _downbeats_for_studio(metadata, "a")
+                if not studio.get("beats_b"):
+                    studio["beats_b"] = _beats_for_studio(metadata, "b")
+                    studio["downbeats_b"] = _downbeats_for_studio(metadata, "b")
         return studio
     meta_path = session_dir / "metadata.json"
     if not meta_path.is_file():
@@ -318,13 +402,25 @@ def column_mix_duration_ms(
     sections_b: list[dict[str, Any]],
 ) -> int:
     """
-    Column length = max(stored duration, longest enabled source section).
+    Column length for mixing.
 
-    Shorter stems are looped to fill this window (see ``fit_length``).
+    If ``duration_lock_key`` points at an enabled cell, use that cell's source
+    section length only (no max-of-all / no looping fill).
+
+    Otherwise: max(stored duration, longest enabled source section).
     """
     cells = column.get("cells") or {}
-    lengths: list[int] = []
     sections_map = {"a": sections_a, "b": sections_b}
+    lock_key = column.get("duration_lock_key")
+    if isinstance(lock_key, str) and lock_key:
+        locked = cells.get(lock_key)
+        if locked and locked.get("enabled"):
+            song = "a" if lock_key.startswith("a:") else "b"
+            return _cell_source_duration_ms(
+                sections_map[song], int(locked.get("source_section_index") or 0)
+            )
+
+    lengths: list[int] = []
     for song in ("a", "b"):
         for stem in STEMS:
             cell = cells.get(_cell_key(song, stem)) or cells.get(f"{song}_{stem}")
@@ -411,10 +507,15 @@ def render_studio(
                 channels = seg.channels or channels
                 layers.append(seg)
 
-        # Stay on this mashup section until the longest enabled source finishes;
-        # shorter sources are looped via fit_length.
+        # Duration: locked cell wins; otherwise max of enabled sources (loop fill).
+        lock_key = column.get("duration_lock_key")
+        locked = bool(
+            isinstance(lock_key, str)
+            and lock_key
+            and (cells.get(lock_key) or {}).get("enabled")
+        )
         duration_ms = column_mix_duration_ms(column, sections_a, sections_b)
-        if layers:
+        if layers and not locked:
             duration_ms = max(duration_ms, max(len(s) for s in layers))
         if duration_ms <= 0:
             duration_ms = 4000
@@ -425,7 +526,8 @@ def render_studio(
             channels
         )
         for seg in layers:
-            fitted = fit_length(seg, duration_ms)
+            # Locked column: trim/pad only — never loop shorter stems.
+            fitted = fit_length(seg, duration_ms, loop=not locked)
             canvas = canvas.overlay(fitted)
         mixed.append(canvas)
 

@@ -36,6 +36,10 @@
   const LABEL_W = 120;
   const PX_PER_SEC = 40;
   const MIN_SECTION_SEC = 0.25;
+  /** Pull-in distance to snap a boundary to a beat. */
+  const BEAT_SNAP_IN_SEC = 0.15;
+  /** Pull farther than this to release an active snap. */
+  const BEAT_SNAP_OUT_SEC = 0.35;
 
   const STEMS = [
     { id: "vocals", label: "vocals" },
@@ -72,6 +76,8 @@
   let pendingSections = { a: null, b: null };
   /** @type {{ a: Float32Array | null, b: Float32Array | null, aDur: number, bDur: number }} */
   let wavePeaks = { a: null, b: null, aDur: 0, bDur: 0 };
+  /** Boundary ticker freeform mode by key, e.g. "a:mid:2", "b:start". */
+  const handleFreeformMode = new Map();
 
   const STAGE_MESSAGES = [
     "Uploading tracks…",
@@ -229,8 +235,17 @@
     if (!studioState || !col) return Number(col?.duration_ms) || 4000;
     const sectionsA = sectionsForSong("a");
     const sectionsB = sectionsForSong("b");
-    const lengths = [];
     const cells = col.cells || {};
+    const lockKey = col.duration_lock_key;
+    if (lockKey && cells[lockKey] && cells[lockKey].enabled) {
+      const song = String(lockKey).startsWith("a:") ? "a" : "b";
+      const sections = song === "a" ? sectionsA : sectionsB;
+      return sectionDurationMs(
+        sections,
+        Number(cells[lockKey].source_section_index) || 0
+      );
+    }
+    const lengths = [];
     for (const song of ["a", "b"]) {
       const sections = song === "a" ? sectionsA : sectionsB;
       for (const stem of STEMS) {
@@ -247,6 +262,18 @@
       return stored > 0 ? Math.max(stored, natural) : natural;
     }
     return stored || 4000;
+  }
+
+  function toggleColumnDurationLock(colIndex, cellKeyName) {
+    if (!studioState?.columns?.[colIndex]) return;
+    const col = studioState.columns[colIndex];
+    if (col.duration_lock_key === cellKeyName) {
+      col.duration_lock_key = null;
+    } else {
+      col.duration_lock_key = cellKeyName;
+    }
+    renderStudioGrid();
+    afterStudioGridEdit();
   }
 
   function totalTimelineMs() {
@@ -455,6 +482,9 @@
         enabled: false,
         source_section_index: 0,
       };
+      if (studioState.columns[colIndex].duration_lock_key === key) {
+        studioState.columns[colIndex].duration_lock_key = null;
+      }
       picker.remove();
       renderStudioGrid();
       afterStudioGridEdit();
@@ -514,7 +544,10 @@
     studioState.columns.forEach((col, i) => {
       const cell = document.createElement("div");
       cell.className = "studio-col-head";
+      cell.style.flex = `0 0 ${widths[i]}px`;
       cell.style.width = `${widths[i]}px`;
+      cell.style.maxWidth = `${widths[i]}px`;
+      cell.style.minWidth = `${widths[i]}px`;
       const title = document.createElement("span");
       title.textContent = col.label || `Sec ${i + 1}`;
       cell.appendChild(title);
@@ -585,24 +618,53 @@
             enabled: false,
             source_section_index: 0,
           };
-          const cell = document.createElement("button");
-          cell.type = "button";
+          const cell = document.createElement("div");
           cell.className = `studio-cell${data.enabled ? " on" : " off"}`;
-          cell.style.width = `${widths[colIndex]}px`;
+          const colW = widths[colIndex];
+          cell.style.flex = `0 0 ${colW}px`;
+          cell.style.width = `${colW}px`;
+          cell.style.maxWidth = `${colW}px`;
+          cell.style.minWidth = `${colW}px`;
           const sections = sectionsForSong(song.id);
+          const labelBtn = document.createElement("button");
+          labelBtn.type = "button";
+          labelBtn.className = "studio-cell-main";
           if (data.enabled) {
-            cell.textContent = sectionLabel(sections, data.source_section_index);
+            labelBtn.textContent = sectionLabel(
+              sections,
+              data.source_section_index
+            );
             cell.style.boxShadow = `inset 3px 0 0 ${sectionColor(
               sections,
               data.source_section_index
             )}`;
           } else {
-            cell.textContent = "—";
+            labelBtn.textContent = "—";
             cell.style.boxShadow = "";
           }
-          cell.addEventListener("click", () =>
-            openSectionPicker(song.id, stem.id, colIndex, cell)
+          labelBtn.addEventListener("click", () =>
+            openSectionPicker(song.id, stem.id, colIndex, labelBtn)
           );
+          cell.appendChild(labelBtn);
+          if (data.enabled) {
+            const lockBtn = document.createElement("button");
+            lockBtn.type = "button";
+            const locked = col.duration_lock_key === key;
+            lockBtn.className = `studio-cell-lock${locked ? " locked" : ""}`;
+            lockBtn.title = locked
+              ? "Unlock — column uses longest source (loop shorter)"
+              : "Lock — column ends when this section ends (no loop)";
+            lockBtn.setAttribute(
+              "aria-label",
+              locked ? "Unlock duration" : "Lock duration to this section"
+            );
+            lockBtn.textContent = locked ? "🔒" : "🔓";
+            lockBtn.addEventListener("click", (event) => {
+              event.stopPropagation();
+              toggleColumnDurationLock(colIndex, key);
+            });
+            cell.appendChild(lockBtn);
+          }
           row.appendChild(cell);
         });
         group.appendChild(row);
@@ -625,6 +687,82 @@
     return wavePeaks.bDur || 0;
   }
 
+  function beatsForSong(song) {
+    if (!studioState) return [];
+    const key = song === "a" ? "beats_a" : "beats_b";
+    const fromStudio = studioState[key];
+    if (Array.isArray(fromStudio) && fromStudio.length) {
+      return fromStudio.map(Number).filter((t) => Number.isFinite(t));
+    }
+    // Fallback: metadata structure (original clock ≈ fine when BPM matched).
+    const struct =
+      (mashupMeta && mashupMeta[song === "a" ? "structure_a" : "structure_b"]) ||
+      {};
+    const beats = struct.beats;
+    if (Array.isArray(beats) && beats.length) {
+      return beats.map(Number).filter((t) => Number.isFinite(t));
+    }
+    const bpm = Number(struct.bpm || studioState.target_bpm || 0);
+    const dur = songDuration(song);
+    if (!(bpm > 0) || !(dur > 0)) return [];
+    const step = 60 / bpm;
+    const out = [];
+    for (let t = 0; t <= dur + 1e-6; t += step) out.push(t);
+    return out;
+  }
+
+  function downbeatsForSong(song) {
+    if (!studioState) return [];
+    const key = song === "a" ? "downbeats_a" : "downbeats_b";
+    const fromStudio = studioState[key];
+    if (Array.isArray(fromStudio) && fromStudio.length) {
+      return fromStudio.map(Number).filter((t) => Number.isFinite(t));
+    }
+    const struct =
+      (mashupMeta && mashupMeta[song === "a" ? "structure_a" : "structure_b"]) ||
+      {};
+    const downs = struct.downbeats;
+    if (Array.isArray(downs) && downs.length) {
+      return downs.map(Number).filter((t) => Number.isFinite(t));
+    }
+    return [];
+  }
+
+  /**
+   * Magnetic snap: stick to a beat when close; stay stuck until the pointer
+   * pulls farther than SNAP_OUT, then free-drag until near another beat.
+   */
+  function createBeatSnapper(song, minT, maxT) {
+    const lo = minT == null ? -Infinity : minT;
+    const hi = maxT == null ? Infinity : maxT;
+    const beats = beatsForSong(song).filter((b) => b >= lo - 1e-6 && b <= hi + 1e-6);
+    let snappedTo = null;
+    return function snapTime(rawT) {
+      if (!beats.length) return rawT;
+      if (snappedTo != null) {
+        if (Math.abs(rawT - snappedTo) > BEAT_SNAP_OUT_SEC) {
+          snappedTo = null;
+        } else {
+          return snappedTo;
+        }
+      }
+      let best = null;
+      let bestDist = Infinity;
+      for (let i = 0; i < beats.length; i += 1) {
+        const d = Math.abs(rawT - beats[i]);
+        if (d < bestDist) {
+          bestDist = d;
+          best = beats[i];
+        }
+      }
+      if (best != null && bestDist <= BEAT_SNAP_IN_SEC) {
+        snappedTo = best;
+        return snappedTo;
+      }
+      return rawT;
+    };
+  }
+
   function drawWaveform(song) {
     const canvas = document.getElementById(`wave-canvas-${song}`);
     const track = document.getElementById(`wave-track-${song}`);
@@ -641,6 +779,28 @@
     ctx.clearRect(0, 0, width, 64);
     ctx.fillStyle = "rgba(214, 245, 120, 0.08)";
     ctx.fillRect(0, 0, width, 64);
+
+    // Beat grid (light dotted); downbeats slightly stronger.
+    const beats = beatsForSong(song);
+    const downSet = new Set(
+      downbeatsForSong(song).map((t) => Math.round(t * 1000) / 1000)
+    );
+    for (const t of beats) {
+      if (t < 0 || t > dur) continue;
+      const x = Math.round((t / dur) * width) + 0.5;
+      const isDown = downSet.has(Math.round(t * 1000) / 1000);
+      ctx.strokeStyle = isDown
+        ? "rgba(214, 245, 120, 0.28)"
+        : "rgba(214, 245, 120, 0.14)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash(isDown ? [3, 3] : [2, 4]);
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, 64);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
     ctx.fillStyle = "rgba(214, 245, 120, 0.55)";
     const mid = 32;
     for (let x = 0; x < width; x += 1) {
@@ -713,15 +873,34 @@
         localHead.style.left = `${ratio * 100}%`;
       }
       region.appendChild(localHead);
+      // Click on the section body (not play / handles) scrubs when this section is active.
+      region.addEventListener("click", (event) => {
+        if (
+          event.target.closest(".wave-play-wrap") ||
+          event.target.closest(".wave-handle")
+        ) {
+          return;
+        }
+        if (
+          !activeSectionPreview ||
+          activeSectionPreview.song !== song ||
+          activeSectionPreview.index !== i
+        ) {
+          return;
+        }
+        event.preventDefault();
+        scrubSectionPreviewAt(song, event.clientX);
+      });
       host.appendChild(region);
     });
 
     // Shared boundaries between adjacent sections.
     for (let i = 1; i < sections.length; i += 1) {
       const boundary = Number(sections[i].start_sec) || 0;
+      const modeKey = `${song}:mid:${i}`;
       host.appendChild(
-        makeWaveHandle(song, (boundary / dur) * width, () =>
-          beginBoundaryDrag(song, i - 1, i)
+        makeWaveHandle(song, (boundary / dur) * width, modeKey, (freeform) =>
+          beginBoundaryDrag(song, i - 1, i, { freeform })
         )
       );
     }
@@ -732,29 +911,56 @@
       const lastEnd =
         Number(sections[sections.length - 1].end_sec) || dur;
       host.appendChild(
-        makeWaveHandle(song, (firstStart / dur) * width, () =>
-          beginEdgeDrag(song, "start")
+        makeWaveHandle(song, (firstStart / dur) * width, `${song}:start`, (freeform) =>
+          beginEdgeDrag(song, "start", { freeform })
         )
       );
       host.appendChild(
-        makeWaveHandle(song, (lastEnd / dur) * width, () =>
-          beginEdgeDrag(song, "end")
+        makeWaveHandle(song, (lastEnd / dur) * width, `${song}:end`, (freeform) =>
+          beginEdgeDrag(song, "end", { freeform })
         )
       );
     }
   }
 
-  function makeWaveHandle(song, leftPx, onDown) {
+  function makeWaveHandle(song, leftPx, modeKey, onDown) {
     const handle = document.createElement("div");
-    handle.className = "wave-handle";
+    const freeform = Boolean(handleFreeformMode.get(modeKey));
+    handle.className = `wave-handle${freeform ? " freeform" : ""}`;
+    handle.dataset.modeKey = modeKey;
     handle.style.left = `${leftPx}px`;
-    handle.title = "Drag to resize sections";
+    handle.title = freeform
+      ? "Freeform — double-click for snap mode"
+      : "Snap mode — double-click for freeform";
     handle.setAttribute("role", "slider");
-    handle.setAttribute("aria-label", "Section boundary");
-    handle.addEventListener("mousedown", (event) => {
+    handle.setAttribute(
+      "aria-label",
+      freeform ? "Section boundary freeform" : "Section boundary snap"
+    );
+    handle.addEventListener("dblclick", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      onDown();
+      const next = !handleFreeformMode.get(modeKey);
+      handleFreeformMode.set(modeKey, next);
+      handle.classList.toggle("freeform", next);
+      handle.title = next
+        ? "Freeform — double-click for snap mode"
+        : "Snap mode — double-click for freeform";
+      handle.setAttribute(
+        "aria-label",
+        next ? "Section boundary freeform" : "Section boundary snap"
+      );
+    });
+    handle.addEventListener("mousedown", (event) => {
+      if (event.detail > 1) {
+        // Ignore the mousedown that is part of a double-click.
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      onDown(Boolean(handleFreeformMode.get(modeKey)));
     });
     void song;
     return handle;
@@ -779,6 +985,61 @@
     sync(b, a);
   }
 
+  function songTimeFromClientX(song, clientX) {
+    const track = document.getElementById(`wave-track-${song}`);
+    if (!track) return 0;
+    const dur = songDuration(song) || 1;
+    const width = Math.max(400, Math.round(dur * PX_PER_SEC));
+    const rect = track.getBoundingClientRect();
+    const x = clientX - rect.left;
+    return Math.max(0, Math.min(dur, (x / Math.max(width, 1)) * dur));
+  }
+
+  /**
+   * While a section preview is active for *song*, move its playhead to the
+   * clicked horizontal time and keep playing from there.
+   */
+  async function scrubSectionPreviewAt(song, clientX) {
+    if (!activeSectionPreview || activeSectionPreview.song !== song) return;
+    if (!sectionPreviewAudio || !sectionPreviewAudio.src) return;
+    const { start, end } = activeSectionPreview;
+    const songTime = songTimeFromClientX(song, clientX);
+    // Only scrub inside the active section's span (clamp to edges).
+    const clamped = Math.max(start, Math.min(end, songTime));
+    const offset = Math.max(0, clamped - start);
+    const maxOff = sectionPreviewAudio.duration;
+    sectionPreviewAudio.currentTime = Number.isFinite(maxOff)
+      ? Math.min(offset, Math.max(0, maxOff - 0.01))
+      : offset;
+    updateSectionPlayUi();
+    try {
+      if (sectionPreviewAudio.paused) {
+        await sectionPreviewAudio.play();
+      }
+    } catch {
+      /* autoplay / play race */
+    }
+  }
+
+  function wireWaveformScrubbing() {
+    for (const song of ["a", "b"]) {
+      const strip = document.getElementById(`wave-seek-${song}`);
+      const canvas = document.getElementById(`wave-canvas-${song}`);
+      const title = document.getElementById(`wave-title-${song}`);
+      const bind = (el) => {
+        if (!el || el.dataset.scrubBound === "1") return;
+        el.dataset.scrubBound = "1";
+        el.addEventListener("click", (event) => {
+          event.preventDefault();
+          scrubSectionPreviewAt(song, event.clientX);
+        });
+      };
+      bind(strip);
+      bind(canvas);
+      bind(title);
+    }
+  }
+
   function ensurePending(song) {
     if (song === "a") {
       if (!pendingSections.a) {
@@ -792,7 +1053,7 @@
     return pendingSections.b;
   }
 
-  function beginBoundaryDrag(song, leftIdx, rightIdx) {
+  function beginBoundaryDrag(song, leftIdx, rightIdx, { freeform = false } = {}) {
     const sections = ensurePending(song);
     const dur = songDuration(song) || 1;
     const width = Math.max(400, Math.round(dur * PX_PER_SEC));
@@ -800,12 +1061,17 @@
     const right = sections[rightIdx];
     const minT = (Number(left.start_sec) || 0) + MIN_SECTION_SEC;
     const maxT = (Number(right.end_sec) || dur) - MIN_SECTION_SEC;
+    const snap = freeform
+      ? (t) => t
+      : createBeatSnapper(song, minT, maxT);
     const onMove = (event) => {
       const track = document.getElementById(`wave-track-${song}`);
       if (!track) return;
       const rect = track.getBoundingClientRect();
       const x = event.clientX - rect.left;
       let t = (x / width) * dur;
+      t = Math.max(minT, Math.min(maxT, t));
+      t = snap(t);
       t = Math.max(minT, Math.min(maxT, t));
       left.end_sec = t;
       right.start_sec = t;
@@ -820,11 +1086,12 @@
     document.addEventListener("mouseup", onUp);
   }
 
-  function beginEdgeDrag(song, which) {
+  function beginEdgeDrag(song, which, { freeform = false } = {}) {
     const sections = ensurePending(song);
     if (!sections.length) return;
     const dur = songDuration(song) || 1;
     const width = Math.max(400, Math.round(dur * PX_PER_SEC));
+    const snap = freeform ? (t) => t : createBeatSnapper(song, 0, dur);
     const onMove = (event) => {
       const track = document.getElementById(`wave-track-${song}`);
       if (!track) return;
@@ -836,12 +1103,18 @@
         const first = sections[0];
         const maxStart =
           (Number(first.end_sec) || dur) - MIN_SECTION_SEC;
-        first.start_sec = Math.max(0, Math.min(maxStart, t));
+        t = Math.max(0, Math.min(maxStart, t));
+        t = snap(t);
+        t = Math.max(0, Math.min(maxStart, t));
+        first.start_sec = t;
       } else {
         const last = sections[sections.length - 1];
         const minEnd =
           (Number(last.start_sec) || 0) + MIN_SECTION_SEC;
-        last.end_sec = Math.max(minEnd, Math.min(dur, t));
+        t = Math.max(minEnd, Math.min(dur, t));
+        t = snap(t);
+        t = Math.max(minEnd, Math.min(dur, t));
+        last.end_sec = t;
       }
       renderWaveRegions(song);
       updateCommitButton();
@@ -981,6 +1254,7 @@
       renderWaveRegions("a");
       renderWaveRegions("b");
       wireWaveformScrollSync();
+      wireWaveformScrubbing();
     } catch (err) {
       console.warn(err);
       // Still show regions without peaks.
@@ -995,6 +1269,7 @@
       renderWaveRegions("a");
       renderWaveRegions("b");
       wireWaveformScrollSync();
+      wireWaveformScrubbing();
     }
   }
 
@@ -1099,6 +1374,149 @@
     objectUrl = `/api/mashup/sessions/${id}/mashup`;
     showMashupResult(objectUrl);
     await loadStudioState();
+    const url = new URL(window.location.href);
+    url.searchParams.set("session", id);
+    window.history.replaceState({}, "", url);
+  }
+
+  function startNewSession() {
+    // Stop playback / clear in-memory work; keep disk sessions intact.
+    try {
+      mashupAudio.pause();
+      studioAudio.pause();
+      if (sectionPreviewAudio) sectionPreviewAudio.pause();
+    } catch {
+      /* ignore */
+    }
+    sessionId = null;
+    mashupMeta = null;
+    studioState = null;
+    pendingSections = { a: null, b: null };
+    songA = null;
+    songB = null;
+    studioDirty = true;
+    studioAudioReady = false;
+    playheadTimeSec = 0;
+    activeSectionPreview = null;
+    handleFreeformMode.clear();
+    if (objectUrl && objectUrl.startsWith("blob:")) URL.revokeObjectURL(objectUrl);
+    if (studioObjectUrl) URL.revokeObjectURL(studioObjectUrl);
+    if (sectionPreviewUrl) URL.revokeObjectURL(sectionPreviewUrl);
+    objectUrl = null;
+    studioObjectUrl = null;
+    sectionPreviewUrl = null;
+    nameA.textContent = "Drag audio here";
+    nameB.textContent = "Drag audio here";
+    zoneA.classList.remove("filled");
+    zoneB.classList.remove("filled");
+    if (fileA) fileA.value = "";
+    if (fileB) fileB.value = "";
+    updateButton();
+    resultRow.hidden = true;
+    sectionEditor.hidden = true;
+    statusPanel.hidden = true;
+    progressWrap.hidden = true;
+    hideError();
+    if (studioDownload) studioDownload.hidden = true;
+    if (arrangementHint) arrangementHint.hidden = true;
+    if (studioWaveforms) studioWaveforms.hidden = true;
+    if (studioBoard) studioBoard.innerHTML = "";
+    setPlayIcons(false);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("session");
+    window.history.replaceState({}, "", url);
+    closeSessionDrawer();
+  }
+
+  function formatSessionWhen(ts) {
+    if (!ts) return "";
+    try {
+      return new Date(ts * 1000).toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      });
+    } catch {
+      return "";
+    }
+  }
+
+  function truncateTitle(name, max = 28) {
+    const s = String(name || "").trim() || "Untitled";
+    return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  }
+
+  async function refreshSessionList() {
+    const list = document.getElementById("session-list");
+    const empty = document.getElementById("session-empty");
+    if (!list) return;
+    list.innerHTML = "";
+    try {
+      const response = await fetch("/api/mashup/sessions");
+      if (!response.ok) throw new Error("Failed to list sessions");
+      const payload = await response.json();
+      const sessions = payload.sessions || [];
+      if (empty) empty.hidden = sessions.length > 0;
+      sessions.forEach((entry) => {
+        const li = document.createElement("li");
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = `session-list-item${
+          entry.id === sessionId ? " active" : ""
+        }`;
+        const pair = document.createElement("div");
+        pair.className = "session-list-pair";
+        pair.textContent = `${truncateTitle(entry.title_a)} × ${truncateTitle(
+          entry.title_b
+        )}`;
+        const meta = document.createElement("div");
+        meta.className = "session-list-meta";
+        const bits = [formatSessionWhen(entry.updated_at)];
+        if (entry.structure_mode) bits.push(String(entry.structure_mode));
+        meta.textContent = bits.filter(Boolean).join(" · ");
+        btn.appendChild(pair);
+        btn.appendChild(meta);
+        btn.addEventListener("click", async () => {
+          closeSessionDrawer();
+          try {
+            await hydrateSession(entry.id);
+          } catch (err) {
+            showError(
+              err instanceof Error ? err.message : "Failed to open session"
+            );
+            statusPanel.hidden = false;
+          }
+        });
+        li.appendChild(btn);
+        list.appendChild(li);
+      });
+    } catch (err) {
+      if (empty) {
+        empty.hidden = false;
+        empty.textContent = "Could not load sessions.";
+      }
+      console.warn(err);
+    }
+  }
+
+  function openSessionDrawer() {
+    const drawer = document.getElementById("session-drawer");
+    const backdrop = document.getElementById("session-backdrop");
+    const menuBtn = document.getElementById("session-menu-btn");
+    if (drawer) drawer.hidden = false;
+    if (backdrop) backdrop.hidden = false;
+    if (menuBtn) menuBtn.setAttribute("aria-expanded", "true");
+    refreshSessionList();
+  }
+
+  function closeSessionDrawer() {
+    const drawer = document.getElementById("session-drawer");
+    const backdrop = document.getElementById("session-backdrop");
+    const menuBtn = document.getElementById("session-menu-btn");
+    if (drawer) drawer.hidden = true;
+    if (backdrop) backdrop.hidden = true;
+    if (menuBtn) menuBtn.setAttribute("aria-expanded", "false");
   }
 
   async function ensureStudioPreviewLoaded() {
@@ -1350,6 +1768,27 @@
         showError(err instanceof Error ? err.message : "Download edit failed.");
       }
     });
+  }
+
+  const sessionMenuBtn = document.getElementById("session-menu-btn");
+  const sessionNewBtn = document.getElementById("session-new-btn");
+  const sessionNewRow = document.getElementById("session-new-row");
+  const sessionDrawerClose = document.getElementById("session-drawer-close");
+  const sessionBackdrop = document.getElementById("session-backdrop");
+  if (sessionMenuBtn) {
+    sessionMenuBtn.addEventListener("click", () => {
+      const drawer = document.getElementById("session-drawer");
+      if (drawer && !drawer.hidden) closeSessionDrawer();
+      else openSessionDrawer();
+    });
+  }
+  if (sessionNewBtn) sessionNewBtn.addEventListener("click", startNewSession);
+  if (sessionNewRow) sessionNewRow.addEventListener("click", startNewSession);
+  if (sessionDrawerClose) {
+    sessionDrawerClose.addEventListener("click", closeSessionDrawer);
+  }
+  if (sessionBackdrop) {
+    sessionBackdrop.addEventListener("click", closeSessionDrawer);
   }
 
   const params = new URLSearchParams(window.location.search);

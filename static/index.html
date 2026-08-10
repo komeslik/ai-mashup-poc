@@ -14,6 +14,46 @@
   </head>
   <body>
     <div class="atmosphere" aria-hidden="true"></div>
+
+    <div class="session-chrome">
+      <button
+        type="button"
+        class="btn-icon session-menu-btn"
+        id="session-menu-btn"
+        title="Sessions"
+        aria-label="Open sessions"
+        aria-expanded="false"
+        aria-controls="session-drawer"
+      >
+        <span class="hamburger" aria-hidden="true"></span>
+      </button>
+      <button
+        type="button"
+        class="btn-icon session-new-btn"
+        id="session-new-btn"
+        title="New session"
+        aria-label="New session"
+      >
+        +
+      </button>
+    </div>
+
+    <aside class="session-drawer" id="session-drawer" hidden>
+      <div class="session-drawer-head">
+        <h2 class="session-drawer-title">Sessions</h2>
+        <button type="button" class="btn-icon" id="session-drawer-close" aria-label="Close">
+          ×
+        </button>
+      </div>
+      <button type="button" class="session-new-row" id="session-new-row">
+        <span class="session-new-plus">+</span>
+        New session
+      </button>
+      <ul class="session-list" id="session-list"></ul>
+      <p class="session-empty" id="session-empty" hidden>No saved sessions yet.</p>
+    </aside>
+    <div class="session-backdrop" id="session-backdrop" hidden></div>
+
     <main class="shell">
       <header class="brand-block">
         <p class="brand">MASHUP</p>
@@ -226,6 +266,11 @@
               <h3 class="waveform-title" id="wave-title-a">Song A</h3>
               <div class="waveform-scroll" id="wave-scroll-a">
                 <div class="waveform-track" id="wave-track-a">
+                  <div
+                    class="wave-seek-strip"
+                    id="wave-seek-a"
+                    title="Click to scrub while a section is playing"
+                  ></div>
                   <canvas class="waveform-canvas" id="wave-canvas-a" height="64"></canvas>
                   <div class="waveform-regions" id="wave-regions-a"></div>
                 </div>
@@ -235,6 +280,11 @@
               <h3 class="waveform-title" id="wave-title-b">Song B</h3>
               <div class="waveform-scroll" id="wave-scroll-b">
                 <div class="waveform-track" id="wave-track-b">
+                  <div
+                    class="wave-seek-strip"
+                    id="wave-seek-b"
+                    title="Click to scrub while a section is playing"
+                  ></div>
                   <canvas class="waveform-canvas" id="wave-canvas-b" height="64"></canvas>
                   <div class="waveform-regions" id="wave-regions-b"></div>
                 </div>

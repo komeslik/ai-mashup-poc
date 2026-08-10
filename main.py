@@ -177,6 +177,62 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _session_list_entry(session: Path) -> dict[str, Any] | None:
+    meta_path = session / "metadata.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    title_a = "Song A"
+    title_b = "Song B"
+    studio_path = session / "studio.json"
+    if studio_path.is_file():
+        try:
+            studio = json.loads(studio_path.read_text(encoding="utf-8"))
+            title_a = str(studio.get("title_a") or title_a)
+            title_b = str(studio.get("title_b") or title_b)
+        except Exception:  # noqa: BLE001
+            pass
+    if title_a == "Song A":
+        title_a = str(
+            (meta.get("form_a") or {}).get("title")
+            or (meta.get("structure_a") or {}).get("title")
+            or title_a
+        )
+    if title_b == "Song B":
+        title_b = str(
+            (meta.get("form_b") or {}).get("title")
+            or (meta.get("structure_b") or {}).get("title")
+            or title_b
+        )
+    mtime = meta_path.stat().st_mtime
+    return {
+        "id": session.name,
+        "title_a": title_a,
+        "title_b": title_b,
+        "updated_at": mtime,
+        "has_mashup": (session / "mashup.mp3").is_file(),
+        "structure_mode": meta.get("structure_mode"),
+    }
+
+
+@app.get("/api/mashup/sessions")
+def list_sessions() -> JSONResponse:
+    """List saved mashup sessions under /tmp/mashup_sessions."""
+    entries: list[dict[str, Any]] = []
+    if SESSIONS_ROOT.is_dir():
+        for child in SESSIONS_ROOT.iterdir():
+            if not child.is_dir():
+                continue
+            entry = _session_list_entry(child)
+            if entry:
+                entries.append(entry)
+    entries.sort(key=lambda e: float(e.get("updated_at") or 0), reverse=True)
+    return JSONResponse({"sessions": entries})
+
+
 @app.get("/api/mashup/sessions/{session_id}")
 def get_session(session_id: str) -> JSONResponse:
     session = _session_dir(session_id)

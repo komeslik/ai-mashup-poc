@@ -31,6 +31,163 @@ body {
   overflow-x: hidden;
 }
 
+.session-chrome {
+  position: fixed;
+  top: 0.85rem;
+  left: 0.85rem;
+  z-index: 50;
+  display: flex;
+  gap: 0.4rem;
+}
+
+.session-menu-btn .hamburger,
+.session-menu-btn .hamburger::before,
+.session-menu-btn .hamburger::after {
+  display: block;
+  width: 1rem;
+  height: 2px;
+  background: currentColor;
+  border-radius: 1px;
+  position: relative;
+}
+
+.session-menu-btn .hamburger::before,
+.session-menu-btn .hamburger::after {
+  content: "";
+  position: absolute;
+  left: 0;
+}
+
+.session-menu-btn .hamburger::before {
+  top: -5px;
+}
+
+.session-menu-btn .hamburger::after {
+  top: 5px;
+}
+
+.session-new-btn {
+  font-size: 1.35rem;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.session-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.session-drawer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: min(20rem, 88vw);
+  z-index: 60;
+  background: #12180f;
+  border-right: 1px solid rgba(214, 245, 120, 0.22);
+  box-shadow: 12px 0 40px rgba(0, 0, 0, 0.4);
+  padding: 0.85rem 0.75rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  overflow: auto;
+}
+
+.session-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.session-drawer-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+}
+
+.session-new-row {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  width: 100%;
+  border: 1px dashed rgba(214, 245, 120, 0.35);
+  border-radius: 0.45rem;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.92rem;
+  font-weight: 600;
+  padding: 0.65rem 0.75rem;
+  cursor: pointer;
+  text-align: left;
+}
+
+.session-new-row:hover {
+  border-color: var(--accent);
+  background: rgba(214, 245, 120, 0.08);
+}
+
+.session-new-plus {
+  font-size: 1.2rem;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.session-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.session-list-item {
+  appearance: none;
+  width: 100%;
+  border: 1px solid rgba(214, 245, 120, 0.16);
+  border-radius: 0.45rem;
+  background: rgba(10, 14, 10, 0.55);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  padding: 0.65rem 0.7rem;
+  cursor: pointer;
+  display: grid;
+  gap: 0.2rem;
+}
+
+.session-list-item:hover,
+.session-list-item.active {
+  border-color: rgba(214, 245, 120, 0.45);
+  background: rgba(214, 245, 120, 0.1);
+}
+
+.session-list-item.active {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.session-list-pair {
+  font-size: 0.86rem;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.session-list-meta {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.session-empty {
+  margin: 0.5rem 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .atmosphere {
   position: fixed;
   inset: 0;
@@ -420,32 +577,90 @@ body {
   flex: 0 0 auto;
   position: relative;
   border-left: 1px solid rgba(214, 245, 120, 0.12);
-  padding: 0.35rem 0.45rem;
   font-size: 0.75rem;
   text-align: left;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  box-sizing: border-box;
 }
 
 .studio-col-head {
   color: var(--muted);
   font-weight: 500;
   overflow: visible;
-  padding-right: 1.6rem;
+  padding: 0.35rem 1.6rem 0.35rem 0.45rem;
   min-height: 2.6rem;
   display: flex;
   align-items: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .studio-cell {
+  flex: 0 0 auto;
+  position: relative;
+  border-left: 1px solid rgba(214, 245, 120, 0.12);
+  padding: 0;
+  font-size: 0.75rem;
+  text-align: left;
+  overflow: hidden;
+  display: block;
+  min-height: 2.1rem;
+  box-sizing: border-box;
+}
+
+.studio-cell-main {
   appearance: none;
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
   background: transparent;
   color: inherit;
   cursor: pointer;
-  border-top: none;
-  border-right: none;
-  border-bottom: none;
+  border: none;
+  padding: 0.35rem 1.7rem 0.35rem 0.45rem;
+  font: inherit;
+  font-size: 0.75rem;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-sizing: border-box;
+}
+
+.studio-cell.off .studio-cell-main {
+  padding-right: 0.45rem;
+}
+
+.studio-cell-lock {
+  appearance: none;
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 1.45rem;
+  border: none;
+  border-left: 1px solid rgba(214, 245, 120, 0.18);
+  background: rgba(0, 0, 0, 0.28);
+  color: rgba(214, 245, 120, 0.45);
+  cursor: pointer;
+  font-size: 0.72rem;
+  line-height: 1;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+  box-sizing: border-box;
+}
+
+.studio-cell-lock:hover {
+  color: var(--accent);
+  background: rgba(214, 245, 120, 0.12);
+}
+
+.studio-cell-lock.locked {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.16);
 }
 
 .studio-cell.on {
@@ -457,7 +672,7 @@ body {
   color: rgba(214, 245, 120, 0.28);
 }
 
-.studio-cell:hover {
+.studio-cell.on .studio-cell-main:hover {
   background: rgba(214, 245, 120, 0.22);
 }
 
@@ -597,12 +812,30 @@ body {
   flex: 0 0 auto;
 }
 
+.wave-seek-strip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 18px;
+  width: 100%;
+  z-index: 6;
+  cursor: crosshair;
+  background: linear-gradient(
+    to bottom,
+    rgba(214, 245, 120, 0.1),
+    rgba(214, 245, 120, 0.02)
+  );
+  border-bottom: 1px dashed rgba(214, 245, 120, 0.22);
+  pointer-events: auto;
+}
+
 .waveform-canvas {
   display: block;
   height: 64px;
   margin-top: 20px;
   /* intrinsic bitmap width from canvas.width — avoid CSS width:100% expanding oddly */
   max-width: none;
+  cursor: crosshair;
 }
 
 .waveform-regions {
@@ -716,7 +949,7 @@ body {
 }
 
 .wave-handle::after {
-  content: "drag";
+  content: "snap";
   position: absolute;
   left: 50%;
   top: -1px;
@@ -733,10 +966,26 @@ body {
   opacity: 0;
 }
 
+.wave-handle.freeform::before {
+  background: #ef4444;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 0 8px rgba(239, 68, 68, 0.45);
+}
+
+.wave-handle.freeform::after {
+  content: "free";
+  background: #ef4444;
+  color: #fff;
+}
+
 .wave-handle:hover::before,
 .wave-handle:active::before {
   width: 4px;
   background: var(--accent, #d6f578);
+}
+
+.wave-handle.freeform:hover::before,
+.wave-handle.freeform:active::before {
+  background: #f87171;
 }
 
 .wave-handle:hover::after,
