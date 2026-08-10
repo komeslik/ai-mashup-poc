@@ -1,0 +1,43 @@
+# Secrets / local env
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+credentials.json
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Demucs / ML artifacts
+separated/
+models/
+*.pth
+*.th
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Output / temp audio
+mashup.mp3
+*.wav
+tmp/
+temp/
+/tmp/

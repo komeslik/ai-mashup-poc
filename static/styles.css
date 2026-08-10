@@ -1,0 +1,319 @@
+:root {
+  --ink: #0b1210;
+  --panel: rgba(18, 32, 28, 0.72);
+  --line: rgba(214, 245, 120, 0.28);
+  --text: #e8f0e6;
+  --muted: #8fa398;
+  --accent: #d6f578;
+  --accent-deep: #9bc23a;
+  --danger: #ff7a6e;
+  --radius: 18px;
+  --font-display: "Syne", system-ui, sans-serif;
+  --font-body: "Space Grotesk", system-ui, sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  font-family: var(--font-body);
+  color: var(--text);
+  background: var(--ink);
+  overflow-x: hidden;
+}
+
+.atmosphere {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(ellipse 80% 55% at 15% 10%, rgba(214, 245, 120, 0.16), transparent 55%),
+    radial-gradient(ellipse 70% 50% at 90% 85%, rgba(42, 120, 96, 0.35), transparent 50%),
+    linear-gradient(165deg, #08110e 0%, #13231d 48%, #0a100e 100%);
+}
+
+.atmosphere::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  opacity: 0.07;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  pointer-events: none;
+}
+
+.shell {
+  width: min(920px, calc(100% - 2rem));
+  margin: 0 auto;
+  padding: clamp(2.5rem, 8vh, 5rem) 0 4rem;
+}
+
+.brand-block {
+  margin-bottom: 2.25rem;
+  animation: rise 0.7s ease both;
+}
+
+.brand {
+  margin: 0 0 0.65rem;
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: clamp(3.2rem, 10vw, 5.5rem);
+  letter-spacing: -0.04em;
+  line-height: 0.9;
+  color: var(--accent);
+}
+
+.brand-block h1 {
+  margin: 0 0 0.55rem;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: clamp(1.35rem, 3.2vw, 1.85rem);
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  max-width: 16ch;
+}
+
+.lede {
+  margin: 0;
+  color: var(--muted);
+  font-size: 1rem;
+  max-width: 38ch;
+  line-height: 1.45;
+}
+
+.drop-row {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: 1rem;
+  align-items: stretch;
+  animation: rise 0.7s ease 0.08s both;
+}
+
+.plus {
+  display: grid;
+  place-items: center;
+  font-family: var(--font-display);
+  font-size: 1.75rem;
+  color: var(--accent);
+  opacity: 0.7;
+  padding-top: 0.5rem;
+}
+
+.dropzone {
+  position: relative;
+  min-height: 168px;
+  padding: 1.25rem 1.35rem;
+  border: 1.5px dashed var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  backdrop-filter: blur(10px);
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    background 0.2s ease,
+    transform 0.2s ease;
+}
+
+.dropzone:hover,
+.dropzone:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  transform: translateY(-2px);
+}
+
+.dropzone.dragover {
+  border-color: var(--accent);
+  border-style: solid;
+  background: rgba(214, 245, 120, 0.08);
+}
+
+.dropzone.filled {
+  border-style: solid;
+  border-color: rgba(214, 245, 120, 0.55);
+}
+
+.slot-label {
+  display: inline-block;
+  margin-bottom: 1.1rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent-deep);
+}
+
+.drop-title {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+  font-weight: 500;
+  word-break: break-word;
+}
+
+.drop-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.actions {
+  margin-top: 1.5rem;
+  animation: rise 0.7s ease 0.14s both;
+}
+
+.btn-primary,
+.btn-download {
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  font-family: var(--font-body);
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition:
+    transform 0.15s ease,
+    opacity 0.15s ease,
+    background 0.15s ease;
+}
+
+.btn-primary {
+  padding: 0.95rem 1.8rem;
+  background: var(--accent);
+  color: #10170f;
+}
+
+.btn-primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: #e4ff8f;
+}
+
+.btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-primary.busy {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.status-panel {
+  margin-top: 1.75rem;
+  animation: rise 0.45s ease both;
+}
+
+.progress-wrap {
+  padding: 1.1rem 1.2rem 1.25rem;
+  border-radius: var(--radius);
+  background: var(--panel);
+  border: 1px solid rgba(214, 245, 120, 0.14);
+}
+
+.progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.92rem;
+  color: var(--muted);
+}
+
+#progress-label {
+  color: var(--text);
+}
+
+.progress-track {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  width: 32%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent-deep), var(--accent));
+  transform: translateX(-120%);
+}
+
+.progress-bar.indeterminate {
+  animation: slide 1.35s ease-in-out infinite;
+}
+
+.progress-bar.done {
+  width: 100%;
+  transform: none;
+  animation: none;
+}
+
+.error {
+  margin: 1rem 0 0;
+  color: var(--danger);
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+
+.btn-download {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1.1rem;
+  padding: 0.95rem 1.8rem;
+  text-decoration: none;
+  background: transparent;
+  color: var(--accent);
+  border: 1.5px solid var(--accent);
+}
+
+.btn-download:hover {
+  background: rgba(214, 245, 120, 0.1);
+  transform: translateY(-1px);
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slide {
+  0% {
+    transform: translateX(-120%);
+  }
+  50% {
+    transform: translateX(180%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+@media (max-width: 720px) {
+  .drop-row {
+    grid-template-columns: 1fr;
+  }
+
+  .plus {
+    padding: 0;
+    transform: rotate(0deg);
+    line-height: 1;
+  }
+
+  .brand-block h1 {
+    max-width: none;
+  }
+}

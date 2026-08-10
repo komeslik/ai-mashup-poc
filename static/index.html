@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MASHUP</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=Syne:wght@700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="atmosphere" aria-hidden="true"></div>
+    <main class="shell">
+      <header class="brand-block">
+        <p class="brand">MASHUP</p>
+        <h1>Drop two tracks. Get one blend.</h1>
+        <p class="lede">
+          Stem separation, BPM align, and a mixed MP3 — usually a few minutes.
+        </p>
+      </header>
+
+      <section class="drop-row" aria-label="Song uploads">
+        <div
+          class="dropzone"
+          id="zone-a"
+          data-slot="a"
+          tabindex="0"
+          role="button"
+          aria-label="Upload song A"
+        >
+          <input
+            type="file"
+            id="file-a"
+            accept="audio/*,.mp3,.wav,.flac,.m4a,.ogg"
+            hidden
+          />
+          <span class="slot-label">Song A</span>
+          <p class="drop-title" id="name-a">Drag audio here</p>
+          <p class="drop-hint">or click to browse</p>
+        </div>
+
+        <div class="plus" aria-hidden="true">×</div>
+
+        <div
+          class="dropzone"
+          id="zone-b"
+          data-slot="b"
+          tabindex="0"
+          role="button"
+          aria-label="Upload song B"
+        >
+          <input
+            type="file"
+            id="file-b"
+            accept="audio/*,.mp3,.wav,.flac,.m4a,.ogg"
+            hidden
+          />
+          <span class="slot-label">Song B</span>
+          <p class="drop-title" id="name-b">Drag audio here</p>
+          <p class="drop-hint">or click to browse</p>
+        </div>
+      </section>
+
+      <div class="actions">
+        <button type="button" class="btn-primary" id="mashup-btn" disabled>
+          Mashup
+        </button>
+      </div>
+
+      <section class="status-panel" id="status-panel" hidden>
+        <div class="progress-wrap" id="progress-wrap">
+          <div class="progress-meta">
+            <span id="progress-label">Working…</span>
+            <span id="elapsed">0:00</span>
+          </div>
+          <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuetext="In progress">
+            <div class="progress-bar" id="progress-bar"></div>
+          </div>
+        </div>
+
+        <p class="error" id="error-msg" hidden></p>
+
+        <a class="btn-download" id="download-btn" hidden download="mashup.mp3">
+          Download mashup.mp3
+        </a>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
