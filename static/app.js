@@ -27,6 +27,7 @@
     "Detecting BPM…",
     "Choosing mix strategy…",
     "Time-stretching vocals…",
+    "Matching vocal key to instrumental…",
     "Mixing stems…",
     "Almost there…",
   ];
@@ -116,8 +117,13 @@
     downloadBtn.removeAttribute("href");
     progressWrap.hidden = false;
     progressBar.classList.remove("done");
+    progressBar.style.width = "";
     progressBar.classList.add("indeterminate");
     hideError();
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   async function runMashup() {
@@ -176,11 +182,24 @@
       const blob = await response.blob();
       objectUrl = URL.createObjectURL(blob);
 
+      // Finish the bar before revealing download (and keep download hidden until then).
+      timers.forEach(clearInterval);
+      timers.length = 0;
+      downloadBtn.hidden = true;
+      progressWrap.hidden = false;
+      progressBar.classList.remove("indeterminate");
+      progressBar.classList.add("done");
+      progressBar.style.width = "100%";
+      progressLabel.textContent = "Ready";
+      elapsedEl.textContent = formatElapsed(Date.now() - started);
+      await sleep(450);
+
       progressWrap.hidden = true;
       downloadBtn.href = objectUrl;
       downloadBtn.hidden = false;
     } catch (err) {
       progressWrap.hidden = true;
+      downloadBtn.hidden = true;
       const message =
         err instanceof Error ? err.message : "Something went wrong during mashup.";
       showError(message);

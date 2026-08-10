@@ -23,7 +23,14 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 from services.agent import MashupDecision, decide_mashup_strategy
-from services.audio import get_bpm, mix_stems, time_stretch_audio
+from services.audio import (
+    get_bpm,
+    get_key,
+    mix_stems,
+    pitch_shift_audio,
+    semitones_to_match_key,
+    time_stretch_audio,
+)
 from services.demucs import DemucsError, separate_stems
 
 load_dotenv()
@@ -38,6 +45,7 @@ app = FastAPI(title="AI Song Mashup API", version="0.1.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 STRETCH_EPSILON = 0.01
+PITCH_EPSILON = 0.01
 
 
 def _suffix_for_upload(upload: UploadFile, default: str = ".mp3") -> str:
@@ -83,7 +91,7 @@ async def create_mashup(
     song_b: UploadFile = File(..., description="Second song audio file"),
 ) -> FileResponse:
     """
-    Separate stems, decide a mix strategy, time-stretch vocals, and return an MP3.
+    Separate stems, decide a mix strategy, align BPM/key, and return an MP3.
     """
     # Persist the final mashup outside the working TemporaryDirectory so
     # FileResponse can stream it after workspace cleanup.
@@ -154,6 +162,36 @@ async def create_mashup(
                     raise HTTPException(
                         status_code=500,
                         detail=f"Time-stretch failed: {exc}",
+                    ) from exc
+
+            try:
+                vocal_key = get_key(vocals_for_mix)
+                instrumental_key = get_key(instrumental_path)
+                n_steps = semitones_to_match_key(vocal_key, instrumental_key)
+                logger.info(
+                    "Key detect — vocals: %s, instrumental: %s, shift: %+d semitones",
+                    vocal_key,
+                    instrumental_key,
+                    n_steps,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Key detection failed: {exc}",
+                ) from exc
+
+            if abs(n_steps) >= PITCH_EPSILON:
+                pitched_vocals = work / "vocals_pitched.wav"
+                try:
+                    vocals_for_mix = pitch_shift_audio(
+                        vocals_for_mix,
+                        str(pitched_vocals),
+                        float(n_steps),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Pitch-shift failed: {exc}",
                     ) from exc
 
             try:

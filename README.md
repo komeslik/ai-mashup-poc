@@ -29,7 +29,7 @@ Song A + Song B
 └─────────┬───────────┘
           ▼
 ┌─────────────────────┐
-│ 4. OpenAI decision  │  which vocals / instrumental / target BPM
+│ 4. LLM decision     │  Gemini or OpenAI → MashupDecision
 └─────────┬───────────┘
           ▼
 ┌─────────────────────┐
@@ -37,7 +37,11 @@ Song A + Song B
 └─────────┬───────────┘
           ▼
 ┌─────────────────────┐
-│ 6. Mix + export     │  pydub overlay → mashup.mp3
+│ 6. Key match        │  chroma key detect + pitch_shift vocals
+└─────────┬───────────┘
+          ▼
+┌─────────────────────┐
+│ 7. Mix + export     │  pydub overlay → mashup.mp3
 └─────────────────────┘
 ```
 
@@ -60,7 +64,7 @@ Song A + Song B
    `--mp3` uses `lameenc` for export (avoids a known `torchaudio` / `torchcodec` WAV save issue on newer PyTorch stacks).
 
 3. **BPM detection** — `services/audio.py` uses `librosa.beat.beat_track` on each original upload.
-4. **Mixing strategy** — `services/agent.py` calls OpenAI with a Pydantic structured output (`MashupDecision`):
+4. **Mixing strategy** — `services/agent.py` calls **Gemini or OpenAI** (see `LLM_PROVIDER`) with a Pydantic structured output (`MashupDecision`):
 
    | Field | Meaning |
    |-------|---------|
@@ -69,10 +73,11 @@ Song A + Song B
    | `target_bpm` | BPM to align to (usually the instrumental’s) |
    | `stretch_factor` | `target_bpm / vocal_source_bpm` |
 
-   If the OpenAI call fails (or `OPENAI_API_KEY` is missing), a deterministic fallback is used: **A vocals + B instrumental**, stretched to B’s BPM.
+   If the selected provider fails (or its API key is missing), a deterministic fallback is used: **A vocals + B instrumental**, stretched to B’s BPM.
 
 5. **Time-stretch** — Vocals are stretched with `librosa.effects.time_stretch` (skipped if the factor is ~1.0).
-6. **Mix** — `pydub` overlays vocals on the instrumental and exports `mashup.mp3` (requires **ffmpeg**).
+6. **Key match** — Detect keys with chroma STFT profiles, then `pitch_shift` vocals toward the instrumental root.
+7. **Mix** — `pydub` overlays vocals on the instrumental and exports `mashup.mp3` (requires **ffmpeg**).
 
 Demucs runs in a worker thread via `asyncio.to_thread(...)` so the FastAPI event loop is not blocked during the long separation step.
 
@@ -89,7 +94,7 @@ ai-mashup-poc/
 ├── services/
 │   ├── demucs.py           # Local Demucs CLI stem separation
 │   ├── audio.py            # BPM, time-stretch, mix
-│   └── agent.py            # OpenAI MashupDecision + fallback
+│   └── agent.py            # Gemini/OpenAI MashupDecision + fallback
 └── static/
     ├── index.html          # Drag-and-drop UI
     ├── styles.css
@@ -114,14 +119,29 @@ Install ffmpeg (macOS):
 brew install ffmpeg
 ```
 
-### API keys
+### API keys / LLM provider
 
 | Variable | Required? | Purpose |
 |----------|-----------|---------|
-| `OPENAI_API_KEY` | Recommended | LLM mashup strategy |
+| `LLM_PROVIDER` | Optional | `gemini` (default) or `openai` |
+| `GEMINI_API_KEY` | If using Gemini | Google AI Studio / Gemini API key |
+| `GEMINI_MODEL` | Optional | Defaults to `gemini-flash-latest` |
+| `OPENAI_API_KEY` | If using OpenAI | OpenAI API key |
 | `OPENAI_MODEL` | Optional | Defaults to `gpt-4o-mini` |
 
-Stem separation is **local and free**. Without OpenAI, the app still works using the A-vocals / B-instrumental fallback.
+Stem separation is **local and free**. Without a working LLM key for the selected provider, the app still works using the A-vocals / B-instrumental fallback.
+
+Example `.env`:
+
+```env
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-flash-latest
+OPENAI_API_KEY=sk-your_openai_key_here
+OPENAI_MODEL=gpt-4o-mini
+```
+
+Switch providers by changing `LLM_PROVIDER` and restarting uvicorn (or relying on `--reload` after env is loaded — restart is safer for env changes).
 
 ---
 
@@ -141,7 +161,9 @@ pip install -r requirements.txt
 
 # 4. Env file
 cp .env.example .env
-# Edit .env and set OPENAI_API_KEY=sk-...
+# Edit .env — set LLM_PROVIDER and the matching API key
+#   LLM_PROVIDER=gemini  + GEMINI_API_KEY=...
+#   LLM_PROVIDER=openai  + OPENAI_API_KEY=...
 ```
 
 **Do not commit `.env`.** It is gitignored. Only `.env.example` (placeholders) belongs in the repo.

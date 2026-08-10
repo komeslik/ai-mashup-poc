@@ -274,6 +274,13 @@ body {
   border: 1.5px solid var(--accent);
 }
 
+.btn-download[hidden],
+.progress-wrap[hidden],
+.error[hidden],
+.status-panel[hidden] {
+  display: none !important;
+}
+
 .btn-download:hover {
   background: rgba(214, 245, 120, 0.1);
   transform: translateY(-1px);
