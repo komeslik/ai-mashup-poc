@@ -125,6 +125,11 @@ def _suffix_for_upload(upload: UploadFile, default: str = ".mp3") -> str:
     return suffix if suffix else default
 
 
+def _scratch_temp_dir(prefix: str) -> str:
+    """OS temp dir (Windows-safe). Never hardcode /tmp — often missing on Windows."""
+    return tempfile.mkdtemp(prefix=prefix)
+
+
 def _save_upload(upload: UploadFile, destination: Path) -> Path:
     with destination.open("wb") as handle:
         shutil.copyfileobj(upload.file, handle)
@@ -345,7 +350,7 @@ async def get_song_section_preview(
     end: float = 1.0,
 ) -> FileResponse:
     session = _session_dir(session_id)
-    out_dir = tempfile.mkdtemp(prefix="sec_prev_", dir="/tmp")
+    out_dir = _scratch_temp_dir("sec_prev_")
     out_path = Path(out_dir) / "section.mp3"
     try:
         await asyncio.to_thread(
@@ -391,7 +396,7 @@ async def get_clip(
     if src is None:
         raise HTTPException(status_code=404, detail=f"Stem missing: {song}/{stem}")
 
-    out_dir = tempfile.mkdtemp(prefix="clip_", dir="/tmp")
+    out_dir = _scratch_temp_dir("clip_")
     wav_out = Path(out_dir) / "clip.wav"
     mp3_out = Path(out_dir) / "clip.mp3"
     try:
@@ -415,7 +420,7 @@ async def get_clip(
 @app.post("/api/mashup/sessions/{session_id}/studio/preview")
 async def studio_preview(session_id: str, body: StudioPreviewBody) -> FileResponse:
     session = _session_dir(session_id)
-    out_dir = tempfile.mkdtemp(prefix="studio_prev_", dir="/tmp")
+    out_dir = _scratch_temp_dir("studio_prev_")
     out_path = Path(out_dir) / "preview.mp3"
     try:
         studio = load_studio(session)
@@ -480,14 +485,14 @@ async def create_mashup(
         spectral=spectral_weight,
     )
 
-    final_dir = tempfile.mkdtemp(prefix="mashup_out_", dir="/tmp")
+    final_dir = _scratch_temp_dir("mashup_out_")
     final_path = Path(final_dir) / "mashup.mp3"
     session_id = uuid.uuid4().hex
     session_dir = SESSIONS_ROOT / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        with tempfile.TemporaryDirectory(prefix="mashup_work_", dir="/tmp") as work_dir:
+        with tempfile.TemporaryDirectory(prefix="mashup_work_") as work_dir:
             work = Path(work_dir)
             song_a_path = work / f"song_a{_suffix_for_upload(song_a)}"
             song_b_path = work / f"song_b{_suffix_for_upload(song_b)}"
