@@ -96,6 +96,12 @@ body {
   overflow: auto;
 }
 
+/* Author display:flex otherwise beats the HTML hidden attribute. */
+.session-drawer[hidden],
+.session-backdrop[hidden] {
+  display: none !important;
+}
+
 .session-drawer-head {
   display: flex;
   align-items: center;

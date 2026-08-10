@@ -1504,8 +1504,14 @@
     const drawer = document.getElementById("session-drawer");
     const backdrop = document.getElementById("session-backdrop");
     const menuBtn = document.getElementById("session-menu-btn");
-    if (drawer) drawer.hidden = false;
-    if (backdrop) backdrop.hidden = false;
+    if (drawer) {
+      drawer.hidden = false;
+      drawer.removeAttribute("hidden");
+    }
+    if (backdrop) {
+      backdrop.hidden = false;
+      backdrop.removeAttribute("hidden");
+    }
     if (menuBtn) menuBtn.setAttribute("aria-expanded", "true");
     refreshSessionList();
   }
@@ -1514,8 +1520,14 @@
     const drawer = document.getElementById("session-drawer");
     const backdrop = document.getElementById("session-backdrop");
     const menuBtn = document.getElementById("session-menu-btn");
-    if (drawer) drawer.hidden = true;
-    if (backdrop) backdrop.hidden = true;
+    if (drawer) {
+      drawer.hidden = true;
+      drawer.setAttribute("hidden", "");
+    }
+    if (backdrop) {
+      backdrop.hidden = true;
+      backdrop.setAttribute("hidden", "");
+    }
     if (menuBtn) menuBtn.setAttribute("aria-expanded", "false");
   }
 
