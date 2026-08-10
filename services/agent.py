@@ -246,8 +246,8 @@ class ArrangementBlueprint(BaseModel):
             raise ValueError("stretch_factor must be positive")
         if not self.actions:
             raise ValueError("actions must contain at least one StemAction")
-        if len(self.actions) > 8:
-            raise ValueError("actions too long; keep at most 8")
+        if len(self.actions) > 48:
+            raise ValueError("actions too long; keep at most 48")
         # Force Song A anchor bed on the blueprint and every action.
         object.__setattr__(self, "instrumental_source", "song_a")
         allowed = set(self.song_b_hooks.preferred_overlay_stems)
@@ -317,8 +317,8 @@ class MashupBlueprint(BaseModel):
             raise ValueError("stretch_factor must be positive")
         if not self.timeline:
             raise ValueError("timeline must contain at least one segment")
-        if len(self.timeline) > 8:
-            raise ValueError("timeline too long; keep at most 8 segments")
+        if len(self.timeline) > 48:
+            raise ValueError("timeline too long; keep at most 48 segments")
         object.__setattr__(self, "instrumental_source", "song_a")
         return self
 
@@ -586,7 +586,11 @@ def _arrangement_user_prompt(
         "Song A is the fixed instrumental bed. "
         "Describe song_b_hooks first, then StemActions on Song A's SECTION indices "
         "(section_start inclusive, section_end exclusive). "
-        "First action = A intro (index 0); last action = A outro (final index).\n"
+        "Cover Song A's FULL section spine in order (one action per A section index "
+        "0..N-1) so mashup length stays close to Song A — do not skip middle sections "
+        "or collapse to a short highlight reel. "
+        "First action = A intro (index 0); last action = A outro (final index). "
+        "On some mid sections you may use Song B vocals and/or drums overlays.\n"
         f"{_sections_prompt_block('Song A', sections_a)}\n"
         f"{_sections_prompt_block('Song B', sections_b)}\n"
         "Return an ArrangementBlueprint with instrumental_source=song_a."
@@ -612,120 +616,35 @@ def _fallback_arrangement(
     creative_mode: str = "forced_match",
 ) -> ArrangementBlueprint:
     """
-    Anchor-A fallback arc on section indices:
-    A intro → optional buildup mute → B middle (drums overlay) → A chorus → A outro.
+    Full Song A spine fallback: one StemAction per A section so mashup ≈ Song A length.
+
+    Selective B vocals + drums overlay on a mid verse-like section when available.
     """
     del creative_mode
     decision = _fallback_decision(song_a_bpm, song_b_bpm)
-    instr_sections = sections_a
-    a_high = _high_indices(sections_a)
     hooks = SongBHookPlan(
         interesting_elements="percussion / drums from Song B",
         preferred_overlay_stems=["drums"],
         avoid="replacing Song A bed wholesale; other under leads",
     )
 
-    actions: list[StemAction] = []
-    used_instr: set[int] = set()
-    n_a = len(instr_sections)
+    n_a = len(sections_a)
     last_idx = max(n_a - 1, 0)
+    # Pick one mid section for a B guest vocal + drums overlay.
+    guest_idx: int | None = None
+    if n_a >= 4 and sections_b:
+        mid_candidates = [
+            s.index
+            for s in sections_a[1:last_idx]
+            if s.label in ("verse", "bridge", "other", "buildup")
+        ]
+        if not mid_candidates:
+            mid_candidates = [s.index for s in sections_a[1:last_idx]]
+        if mid_candidates:
+            guest_idx = mid_candidates[len(mid_candidates) // 2]
 
-    def _next_instr(prefer: Section | None = None) -> Section | None:
-        if prefer is not None and prefer.index not in used_instr:
-            return prefer
-        for s in instr_sections:
-            if s.index not in used_instr:
-                return s
-        return None
-
-    # Always open on A intro (section 0).
-    early = instr_sections[0] if instr_sections else None
-    if early is not None:
-        used_instr.add(early.index)
-        actions.append(
-            StemAction(
-                section_start=early.index,
-                section_end=early.index + 1,
-                vocal_source="song_a",
-                instrumental_source="song_a",
-                section_name="A intro over A bed",
-            )
-        )
-
-    buildup = next((s for s in instr_sections if s.label == "buildup"), None)
-    buildup = _next_instr(buildup)
-    if buildup is not None and buildup.label == "buildup" and buildup.index != last_idx:
-        used_instr.add(buildup.index)
-        actions.append(
-            StemAction(
-                section_start=buildup.index,
-                section_end=buildup.index + 1,
-                vocal_source="none",
-                instrumental_source="song_a",
-                section_name="Buildup (A instrumental)",
-            )
-        )
-
-    a_for_b_verse = _next_instr()
-    if (
-        a_for_b_verse is not None
-        and sections_b
-        and a_for_b_verse.index != last_idx
-    ):
-        used_instr.add(a_for_b_verse.index)
-        actions.append(
-            StemAction(
-                section_start=a_for_b_verse.index,
-                section_end=a_for_b_verse.index + 1,
-                vocal_source="song_b",
-                instrumental_source="song_a",
-                overlay_from="song_b",
-                overlay_stems=["drums"],
-                overlay_volume_db=-6.0,
-                section_name="B verse + drums over A bed",
-            )
-        )
-
-    high_pref = instr_sections[a_high[0]] if sections_a and a_high else None
-    high_a = next(
-        (
-            s
-            for s in instr_sections
-            if is_high_energy_label(s.label)
-            and s.index not in used_instr
-            and s.index != last_idx
-        ),
-        _next_instr(high_pref) if high_pref and high_pref.index != last_idx else None,
-    )
-    if high_a is not None and high_a.index != last_idx:
-        used_instr.add(high_a.index)
-        actions.append(
-            StemAction(
-                section_start=high_a.index,
-                section_end=high_a.index + 1,
-                vocal_source="song_a",
-                instrumental_source="song_a",
-                section_name="A chorus/drop over A bed",
-            )
-        )
-
-    # Always close on A outro.
-    if n_a > 0:
-        if last_idx not in used_instr or (
-            not actions or actions[-1].section_start != last_idx
-        ):
-            used_instr.add(last_idx)
-            actions.append(
-                StemAction(
-                    section_start=last_idx,
-                    section_end=last_idx + 1,
-                    vocal_source="song_a",
-                    instrumental_source="song_a",
-                    section_name="A outro over A bed",
-                )
-            )
-
-    if not actions:
+    actions: list[StemAction] = []
+    if not sections_a:
         actions.append(
             StemAction(
                 section_start=0,
@@ -735,11 +654,47 @@ def _fallback_arrangement(
                 section_name="Fallback A block",
             )
         )
+    else:
+        for sec in sections_a:
+            idx = sec.index
+            if guest_idx is not None and idx == guest_idx:
+                actions.append(
+                    StemAction(
+                        section_start=idx,
+                        section_end=idx + 1,
+                        vocal_source="song_b",
+                        instrumental_source="song_a",
+                        overlay_from="song_b",
+                        overlay_stems=["drums"],
+                        overlay_volume_db=-6.0,
+                        section_name=f"B guest over A {sec.label} ({idx})",
+                    )
+                )
+            elif sec.label == "buildup" and idx not in (0, last_idx):
+                actions.append(
+                    StemAction(
+                        section_start=idx,
+                        section_end=idx + 1,
+                        vocal_source="none",
+                        instrumental_source="song_a",
+                        section_name=f"A buildup ({idx})",
+                    )
+                )
+            else:
+                actions.append(
+                    StemAction(
+                        section_start=idx,
+                        section_end=idx + 1,
+                        vocal_source="song_a",
+                        instrumental_source="song_a",
+                        section_name=f"A {sec.label or 'section'} ({idx})",
+                    )
+                )
 
     return ArrangementBlueprint(
         arrangement_reasoning=(
-            "Fallback anchor director: Song A bed throughout — A intro, optional "
-            "buildup mute, B middle with drums overlay, A chorus, A outro bookend."
+            "Fallback full Song A spine: one action per A section so mashup length "
+            "tracks Song A; optional mid B guest vocal + drums overlay."
         ),
         song_b_hooks=hooks,
         instrumental_source="song_a",

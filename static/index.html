@@ -75,6 +75,16 @@
           </select>
         </label>
         <label class="control">
+          <span class="control-label">Structure</span>
+          <select id="structure-mode" name="structure_mode">
+            <option value="allin1" selected>
+              allin1 (accurate · slow)
+            </option>
+            <option value="llm">LLM form (fast · rough clocks)</option>
+            <option value="dsp">DSP heuristic (medium)</option>
+          </select>
+        </label>
+        <label class="control">
           <span class="control-label">Vocal schedule</span>
           <select id="vocal-policy" name="vocal_policy">
             <option value="alternate" selected>
@@ -135,29 +145,27 @@
 
         <section class="section-editor" id="section-editor" hidden>
           <h2 class="editor-title">Section editor</h2>
-          <p class="editor-hint">Toggle sections, then rebuild the mashup.</p>
-          <p class="editor-hint" id="director-mode-hint" hidden></p>
+          <p class="editor-hint">
+            Song A and Song B as rows, stems as sub-rows, mashup sections as columns.
+            Hover a cell to change its source section; hover a column edge for +.
+          </p>
           <p class="editor-hint" id="arrangement-hint" hidden></p>
-          <p class="editor-hint" id="stem-actions-hint" hidden></p>
-          <ul class="phrase-list" id="phrase-list"></ul>
-          <button type="button" class="btn-secondary" id="rebuild-btn" hidden>
-            Rebuild from selection
-          </button>
-        </section>
-      </section>
 
-      <section class="library-panel" aria-label="Local library">
-        <h2 class="editor-title">Library</h2>
-        <p class="editor-hint">
-          Drop tracks into <code>library/</code> then refresh. Search ranks them vs Song A.
-        </p>
-        <div class="library-actions">
-          <button type="button" class="btn-secondary" id="library-refresh">Refresh</button>
-          <button type="button" class="btn-secondary" id="library-search" disabled>
-            Rank vs Song A
-          </button>
-        </div>
-        <ul class="library-list" id="library-list"></ul>
+          <div class="studio-toolbar">
+            <button type="button" class="btn-secondary" id="studio-play">Play edit</button>
+            <a class="btn-secondary" id="studio-download" hidden download="mashup-edit.mp3">
+              Download edit
+            </a>
+            <span class="player-time" id="studio-time">0:00 / 0:00</span>
+          </div>
+          <audio id="studio-audio" preload="metadata" hidden></audio>
+
+          <div class="studio-scroll" id="studio-scroll">
+            <div class="studio-board" id="studio-board">
+              <div class="studio-playhead" id="studio-playhead" hidden></div>
+            </div>
+          </div>
+        </section>
       </section>
     </main>
 

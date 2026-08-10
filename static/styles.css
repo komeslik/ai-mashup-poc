@@ -262,8 +262,7 @@ body {
   cursor: not-allowed;
 }
 
-.section-editor,
-.library-panel {
+.section-editor {
   margin-top: 1.5rem;
   padding-top: 0.25rem;
 }
@@ -280,55 +279,183 @@ body {
   font-size: 0.9rem;
 }
 
-.phrase-list,
-.library-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 0.55rem;
-}
-
-.phrase-item,
-.library-item {
-  padding: 0.7rem 0.85rem;
-  border: 1px solid rgba(214, 245, 120, 0.14);
-  border-radius: 0.55rem;
-  background: rgba(16, 23, 15, 0.4);
-  font-size: 0.9rem;
-}
-
-.phrase-item label {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 0.25rem 0.7rem;
-  align-items: start;
-  cursor: pointer;
-}
-
-.phrase-item input {
-  margin-top: 0.2rem;
-}
-
-.phrase-main {
-  font-weight: 600;
-}
-
-.phrase-meta {
-  grid-column: 2;
-  color: var(--muted);
-  font-size: 0.82rem;
-}
-
-.library-actions {
+.studio-toolbar {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.6rem;
+  align-items: center;
+  gap: 0.65rem 0.9rem;
   margin-bottom: 0.85rem;
 }
 
-#rebuild-btn {
-  margin-top: 0.9rem;
+.studio-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  border: 1px solid rgba(214, 245, 120, 0.16);
+  border-radius: 0.55rem;
+  background: rgba(10, 14, 10, 0.55);
+  padding: 0.35rem 0.35rem 0.6rem;
+}
+
+.studio-board {
+  position: relative;
+  min-width: 100%;
+}
+
+.studio-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: var(--accent);
+  pointer-events: none;
+  z-index: 5;
+  transition: transform 0.05s linear;
+}
+
+.studio-row {
+  display: flex;
+  align-items: stretch;
+  min-height: 2.1rem;
+  border-top: 1px solid rgba(214, 245, 120, 0.1);
+}
+
+.studio-header {
+  border-top: none;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: rgba(10, 14, 10, 0.92);
+}
+
+.studio-label {
+  flex: 0 0 7.5rem;
+  width: 7.5rem;
+  padding: 0.35rem 0.5rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  position: sticky;
+  left: 0;
+  background: rgba(10, 14, 10, 0.92);
+  z-index: 3;
+}
+
+.studio-group-label {
+  padding: 0.55rem 0.5rem 0.2rem;
+  font-weight: 600;
+  font-size: 0.92rem;
+  letter-spacing: 0.02em;
+}
+
+.studio-col-head,
+.studio-cell {
+  flex: 0 0 auto;
+  position: relative;
+  border-left: 1px solid rgba(214, 245, 120, 0.12);
+  padding: 0.35rem 0.45rem;
+  font-size: 0.75rem;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.studio-col-head {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.studio-cell {
+  appearance: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  border-top: none;
+  border-right: none;
+  border-bottom: none;
+}
+
+.studio-cell.on {
+  background: rgba(214, 245, 120, 0.14);
+  color: var(--text);
+}
+
+.studio-cell.off {
+  color: rgba(214, 245, 120, 0.28);
+}
+
+.studio-cell:hover {
+  background: rgba(214, 245, 120, 0.22);
+}
+
+.studio-edge-add {
+  position: absolute;
+  right: -0.55rem;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 999px;
+  border: 1px solid rgba(214, 245, 120, 0.45);
+  background: rgba(10, 14, 10, 0.95);
+  color: var(--accent);
+  font-size: 0.75rem;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+  opacity: 0;
+  z-index: 4;
+}
+
+.studio-col-head:hover .studio-edge-add,
+.studio-edge-add.leading {
+  opacity: 1;
+}
+
+.studio-edge-add.leading {
+  position: static;
+  transform: none;
+  opacity: 0.55;
+}
+
+.studio-edge-add.leading:hover,
+.studio-edge-add:hover {
+  opacity: 1;
+}
+
+.studio-picker {
+  position: fixed;
+  z-index: 40;
+  min-width: 10rem;
+  max-height: 14rem;
+  overflow: auto;
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.4rem;
+  border-radius: 0.45rem;
+  border: 1px solid rgba(214, 245, 120, 0.28);
+  background: #12180f;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+
+.studio-picker button {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border-radius: 0.3rem;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.studio-picker button:hover {
+  background: rgba(214, 245, 120, 0.14);
 }
 
 .status-panel {
