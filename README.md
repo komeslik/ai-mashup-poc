@@ -1,5 +1,8 @@
 # AI Song Mashup POC
 
+<img width="753" height="664" alt="Screenshot 2026-08-10 at 3 41 01 AM" src="https://github.com/user-attachments/assets/053a92ef-b70f-4fd1-89d5-62e87a118739" />
+
+
 Local mashup app: upload **Song A** + **Song B**, separate stems with **Demucs**, read real section timestamps with **allin1**, let an **LLM** plan the creative arc (not the clocks), then mix with **librosa / pydub** into an MP3.
 
 Includes:
